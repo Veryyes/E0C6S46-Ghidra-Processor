@@ -1,0 +1,106 @@
+define endian=big;
+define alignment=12;
+
+define space register type=register_space size=2 wordsize=2;
+# 6144 words x 12 bits (1 instruction == 12 bits)
+define space rom type=ram_space size=2 wordsize=2;
+# 640 words x 4 bits
+define space ram type=ram_space size=2 wordsize=1;
+# 160 words x 4 bits
+define space display type=ram_space size=1 wordsize=1;
+# 48 words x 4 bits
+define space io type=ram_space size=1 wordsize=1; 
+
+#############
+# REGISTERS #
+#############
+
+# A and B registers are 4 bits each
+# Round up to 1 byte for each
+define register offset=0 size=1 [A B];
+
+# IX and IY are 12 bit registers
+# Since we can't specify a non-integer number of bytes
+# We round up to 2 bytes to represent the 12 bit register
+define register offset=0 size=2 [IX IY];
+define bitrange XL=IX[0,4]
+				XH=IX[4,4]
+				XP=IX[8,4]
+				XHL=IX[0,8];
+				
+define bitrange YL=IY[0,4]
+				YH=IY[4,4]
+				YP=IY[8,4]
+				YHL=IY[0,8];
+
+# Register Pointer RP is a 4bit register
+# Address the first 16 words of ROM
+define register offset=0 size=1 [ RP ];
+
+# Stack Pointer is 8 bits
+define register offset=0 size=1 [ SP ];
+define bitrange SPH=SP[4,4]
+				SPL=SP[0,4];
+
+# the r and q registers each hold 2 bits
+# define them each as a 1 byte register
+# define register offset=0 size=1 [ r q ];
+# ^ these are actual registers. kinda like macros to registers in instructions
+				
+# New bank pointer (1 bit)
+define register offset=0 size=1 [ NBP ];
+
+# New page pointer (4 bits)
+define register offset=0 size=1 [ NPP ];
+
+# Program counter bank (1 bit)
+define register offset=0 size=1 [ PCB ];
+
+# Program counter page (4 bits)
+define register offset=0 size=1 [ PCP ];
+
+# Program counter step (8 bits)
+define register offset=0 size=1 [ PCS ];
+define bitrange PCSH=PCS[4,4]
+				PCSL=PCS[0,4];
+				
+# Flag Register (I, D, Z, C)
+define register offset=0 size=1 [ F ];
+define bitrange C=F[0,1]
+				Z=F[1,1]
+				D=F[2,1]
+				I=F[3,1];
+			
+##########
+# TOKENS #
+##########
+
+# p -> 5bit imm or label (0x0-0x1f)
+# s -> 8bit imm or label (0x00-0xff)
+# l -> 8bit imm 
+# i -> 4bit imm 
+# instructions are 12 bits, but ghidra enforces multiples of 8
+# Assume MSBs are 0x0 padded
+define token instr(16)
+	op = (8, 12)
+	word1 = (4,7)
+	word2 = (0,3)
+	reg1 = (6,7)
+	reg2 = (4,5)
+	reg3 = (2,3)
+	reg4 = (0,1)
+	
+	# Only the PSET instruction needs these weird 3 bit and 5 bit tokens
+	three_bit = (5,7)
+	five_bit = (0,4)
+;
+
+################
+# INSTRUCTIONS #				
+################
+
+:PSET is op=0xe & three_bit=0x2 {}
+:JP is 
+
+
+

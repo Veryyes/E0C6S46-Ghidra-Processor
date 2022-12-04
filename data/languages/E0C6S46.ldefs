@@ -1,0 +1,13 @@
+<language_definitions>
+    <language processor="E0C6S46"
+              endian="big"
+              size="4"
+              variant="default"
+              version="1.0"
+              slafile="E0C6S46.sla"
+              processorspec="E0C6S46.pspec"
+              id="E0C6S46:2:default">
+        <description>E0C6S46</description>
+        <compiler name="default" spec="E0C6S46.cspec" id="default"/>
+    </language>
+</language_definitions>
