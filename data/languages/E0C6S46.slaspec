@@ -1,13 +1,21 @@
+# Build with
+# https://download.epson-europe.com/pub/electronics-de/asmic/4bit/62family/technicalmanual/tm_6s46.pdf
+# https://download.epson-europe.com/pub/electronics-de/asmic/4bit/60family/62core_e.pdf
+
 define endian=big;
 define alignment=12;
 
 define space register type=register_space size=2 wordsize=2;
+
 # 6144 words x 12 bits (1 instruction == 12 bits)
-define space rom type=ram_space size=2 wordsize=2;
+define space rom type=ram_space size=2 wordsize=2 default;
+
 # 640 words x 4 bits
 define space ram type=ram_space size=2 wordsize=1;
+
 # 160 words x 4 bits
 define space display type=ram_space size=1 wordsize=1;
+
 # 48 words x 4 bits
 define space io type=ram_space size=1 wordsize=1; 
 
@@ -16,60 +24,56 @@ define space io type=ram_space size=1 wordsize=1;
 #############
 
 # A and B registers are 4 bits each
-# Round up to 1 byte for each
-define register offset=0 size=1 [A B];
+# Register Pointer RP is a 4 bit register
+# 	Address the first 16 words of ROM
+# Stack Pointer (SP) is 8 bits
+# New page pointer (NBP) (4 bits)
+# New bank pointer (NPP) (1 bit)
+# Program counter bank (PCB) (1 bit)
+# Program counter page (PCP) (4 bits)
+# Program counter step (PCS) (8 bits)
+# Flag Register (I, D, Z, C)
+
+define register offset=0 size=1 [A B RP SP NBP NPP PCB PCP PCS F];
+#define bitrange SPH=SP[4,4]
+#				SPL=SP[0,4]
+#				PCSH=PCS[4,4]
+#				PCSL=PCS[0,4]
+#				C=F[0,1]
+#				Z=F[1,1]
+#				D=F[2,1]
+#				I=F[3,1];
+
+@define SPH "SP[4,4]"
+@define SPL "SP[0,4]"
+@define PCSH "PCS[4,4]"
+@define PCSL "PCS[0,4]"
+@define C "F[0,1]"
+@define Z "F[1,1]"
+@define D "F[2,1]"
+@define I "F[3,1]"
 
 # IX and IY are 12 bit registers
 # Since we can't specify a non-integer number of bytes
 # We round up to 2 bytes to represent the 12 bit register
-define register offset=0 size=2 [IX IY];
-define bitrange XL=IX[0,4]
-				XH=IX[4,4]
-				XP=IX[8,4]
-				XHL=IX[0,8];
-				
-define bitrange YL=IY[0,4]
-				YH=IY[4,4]
-				YP=IY[8,4]
-				YHL=IY[0,8];
-
-# Register Pointer RP is a 4bit register
-# Address the first 16 words of ROM
-define register offset=0 size=1 [ RP ];
-
-# Stack Pointer is 8 bits
-define register offset=0 size=1 [ SP ];
-define bitrange SPH=SP[4,4]
-				SPL=SP[0,4];
-
-# the r and q registers each hold 2 bits
-# define them each as a 1 byte register
-# define register offset=0 size=1 [ r q ];
-# ^ these are actual registers. kinda like macros to registers in instructions
-				
-# New bank pointer (1 bit)
-define register offset=0 size=1 [ NBP ];
-
-# New page pointer (4 bits)
-define register offset=0 size=1 [ NPP ];
-
-# Program counter bank (1 bit)
-define register offset=0 size=1 [ PCB ];
-
-# Program counter page (4 bits)
-define register offset=0 size=1 [ PCP ];
-
-# Program counter step (8 bits)
-define register offset=0 size=1 [ PCS ];
-define bitrange PCSH=PCS[4,4]
-				PCSL=PCS[0,4];
-				
-# Flag Register (I, D, Z, C)
-define register offset=0 size=1 [ F ];
-define bitrange C=F[0,1]
-				Z=F[1,1]
-				D=F[2,1]
-				I=F[3,1];
+define register offset=10 size=2 [IX IY];
+#define bitrange XL=IX[0,4]
+#				XH=IX[4,4]
+#				XP=IX[8,4]
+#				XHL=IX[0,8];
+#				
+#define bitrange YL=IY[0,4]
+#				YH=IY[4,4]
+#				YP=IY[8,4]
+#				YHL=IY[0,8];
+@define XL "IX[0,4]"
+@define XH "IX[4,4]"
+@define XP "IX[8,4]"
+@define XHL "IX[0,8]"
+@define YL "IY[0,4]"
+@define YH "IY[4,4]"
+@define YP "IY[8,4]"
+@define YHL "IY[0,8]"
 			
 ##########
 # TOKENS #
@@ -89,18 +93,158 @@ define token instr(16)
 	reg2 = (4,5)
 	reg3 = (2,3)
 	reg4 = (0,1)
+	s = (0,7)
+	l = (0,7)
+	x = (0,7)
+	y = (0,7)
+	i = (0,3)
+	r0 = (4,5)
+	r1 = (2,3)
+	r2 = (0,1)
+	q = (0,1)
+	n = (0,3)
 	
 	# Only the PSET instruction needs these weird 3 bit and 5 bit tokens
 	three_bit = (5,7)
-	five_bit = (0,4)
+	p = (0,4)
 ;
 
 ################
 # INSTRUCTIONS #				
 ################
 
-:PSET is op=0xe & three_bit=0x2 {}
-:JP is 
+# Branching Instructions
+:PSET p is op=0xe & three_bit=0x2 & p {}
+:JP s is op=0x0 & s {}
+:JPC s is op=0x2 & s {}
+:JPNC s is op=0x3 & s {}
+:JPZ s is op=0x6 & s {}
+:JNZ s is op=0x7 & s {}
+:JPBA is op=0xf & word1=0xe & word2=0x8 {}
+:CALL s is op=0x4 & s {}
+:CALZ s is op=0x5 & s {}
+:RET is op=0xf & word1=0xd & word2=0xf {}
+:RETS is op=0xf & word1=0xd & word2=0xe {}
+:RETD is op=0x1 {}
 
+# Sys Control Instructions
+:NOP5 is op=0xf & word1=0xf & word2=0xb {}
+:NOP7 is op=0xf & word1=0xf & word2=0xf {}
+:HALT is op=0xf & word1=0xf & word2=0x8 {}
+
+# Index Operation Instructions
+:INCX is op=0xe & word1=0xe & word2=0x0 {}
+:INCY is op=0xe & word1=0xf & word2=0x0 {}
+:LDX x is op=0xb & x {}
+:LDY y is op=0x8 & y {}
+:LDXP r2 is op=0xe & word1=0x8 & reg3=0x0 & r2 {}
+:LDXH r2 is op=0xe & word1=0x8 & reg3=0x1 & r2 {}
+:LDXL r2 is op=0xe & word1=0x8 & reg3=0x2 & r2 {}
+:LDYP r2 is op=0xe & word1=0x9 & reg3=0x0 & r2 {}
+:LDYH r2 is op=0xe & word1=0x9 & reg3=0x1 & r2 {}
+:LDYL r2 is op=0xe & word1=0x9 & reg3=0x2 & r2 {}
+:LDXP r2 is op=0xe & word1=0xa & reg3=0x0 & r2 {}
+:LDXH r2 is op=0xe & word1=0xa & reg3=0x1 & r2 {}
+:LDXL r2 is op=0xe & word1=0xa & reg3=0x2 & r2 {}
+:LDYP r2 is op=0xe & word1=0xb & reg3=0x0 & r2 {}
+:LDYH r2 is op=0xe & word1=0xb & reg3=0x1 & r2 {}
+:LDYL r2 is op=0xe & word1=0xb & reg3=0x2 & r2 {}
+:ADCXH i is op=0xa & word1=0x0 & i {}
+:ADCXL i is op=0xa & word1=0x1 & i {}
+:ADCYH i is op=0xa & word1=0x2 & i {}
+:ADCYL i is op=0xa & word1=0x3 & i {}
+:CPXH i is op=0xa & word1=0x4 & i {}
+:CPXL i is op=0xa & word1=0x5 & i {}
+:CPYH i is op=0xa & word1=0x6 & i {}
+:CPYL i is op=0xa & word1=0x7 & i {}
+
+# Data Transfer Instructions
+:LD r0,i is op=0xe & reg1=0x0 & r0 & i {}
+:LD r1,q is op=0xe & word1=0xc & r1 & q {}
+:LDA n is op=0xf & word1=0xa & n {}
+:LDB n is op=0xf & word1=0xb & n {}
+# LD Mn, A
+:SWA n is op=0xf & word1=0x8 & n {}
+# LD Mn, B
+:SWB n is op=0xf & word1=0x9 & n {}
+:LDPX i is op=0xe & word1=0x6 & i {}
+:LDPX r1,q is op=0xe & word1=0xe & r1 & q {}
+:LDPY i is op=0xe & word1=0x7 & i {}
+:LDPY r1,q is op=0xe & word1=0xf & r1 & q {}
+:LBPX l is op=0x9 & l {}
+
+# Flag Operation Instructions
+:SET i is op=0xf & word1=0x4 & i {}
+:RST i is op=0xf & word1=0x5 & i {}
+:SCF is op=0xf & word1=0x4 & word2=0x1 {}
+:RCF is op=0xf & word1=0x5 & word2=0xe {}
+:SZF is op=0xf & word1=0x4 & word2=0x2 {}
+:RZF is op=0xf & word1=0x5 & word2=0xd {}
+:SDF is op=0xf & word1=0x4 & word2=0x4 {}
+:RDF is op=0xf & word1=0x5 & word2=0xb {}
+:EI is op=0xf & word1=0x4 & word2=0x8 {}
+:DI is op=0xf & word1=0x5 & word2=0x7 {}
+
+# Stack Operation Instructions
+:INC is op=0xf & word1=0xd & word2=0xb {}
+:DEC is op=0xf & word1=0xc & word2=0xb {}
+:PUSH r2 is op=0xf & word1=0xc & reg3=0x0 & r2 {}
+:PUSHXP is op=0xf & word1=0xc & word2=0x4 {}
+:PUSHXH is op=0xf & word1=0xc & word2=0x5 {}
+:PUSHXL is op=0xf & word1=0xc & word2=0x6 {}
+:PUSHYP is op=0xf & word1=0xc & word2=0x7 {}
+:PUSHYH is op=0xf & word1=0xc & word2=0x8 {}
+:PUSHYL is op=0xf & word1=0xc & word2=0x9 {}
+:PUSHF is op=0xf & word1=0xc & word2=0xa {}
+:POP r2 is op=0xf & word1=0xd & reg3=0x0 & r2 {}
+:POPXP is op=0xf & word1=0xd & word2=0x4 {}
+:POPXH is op=0xf & word1=0xd & word2=0x5 {}
+:POPXL is op=0xf & word1=0xd & word2=0x6 {}
+:POPYP is op=0xf & word1=0xd & word2=0x7 {}
+:POPYH is op=0xf & word1=0xd & word2=0x8 {}
+:POPYL is op=0xf & word1=0xd & word2=0x9 {}
+:POPF is op=0xf & word1=0xd & word2=0xa {}
+
+# LD SPH, r
+:SWSPH r2 is op=0xf & word1=0xe & reg3=0x0 & r2 {}
+# LD SPL, r
+:SWSPL r2 is op=0xf & word1=0xf & reg3=0x0 & r2 {}
+:LDSPH r2 is op=0xf & word1=0xe & reg3=0x1 & r2 {}
+:LDSPL r2 is op=0xf & word1=0xf & reg3=0x1 & r2 {}
+
+# Arithmetic Instructions
+:ADD r0,i is op=0xc & reg1=0x0 & r0 & i {}
+:ADD r1,q is op=0xa & word1=0x8 & r1 & q {}
+:ADC r0,i is op=0xc & reg1=0x1 & r0 & i {}
+:ADC r1,q is op=0xa & word1=0x9 & r1 & q {}
+:SUB r1,q is op=0xa & word1=0xa & r1 & q {}
+:SBC r0,i is op=0xd & reg1=0x1 & r0 & i {}
+:SBC r1,q is op=0xa & word1=0xb & r1 & q {}
+:AND r0,i is op=0xc & reg1=0x2 & r0 & i {}
+:AND r1,q is op=0xa & word1=0xc & r1 & q {}
+:OR r0,i is op=0xc & reg1=0x3 & r0 & i {}
+:OR r1,q is op=0xa & word1=0xd & r1 & q {}
+:XOR r0,i is op=0xd & reg1=0x0 & r0 & i {}
+:XOR r1,q is op=0xa & word1=0xe & r1 & q {}
+:CP r0,i is op=0xd & reg1=0x3 & r0 & i {}
+:CP r1,q is op=0xf & word1=0x0 & r1 & q {}
+:FAN r0,i is op=0xd & reg1=0x2 & r0 & i {}
+:FAN r1,q is op=0xf & word1=0x1 & r1 & q {}
+
+# Instruction set is weird on this one
+# bits (2,3) and (0,1) are set to r1, r0 bits, which are the same...
+# Weird Specifying this since it would look like 2 args to Ghidra so
+# Going to make two versions for r to be in both positions
+:RLC1 r1 is op=0xa & word1=0xf & reg4=0x0 & r1 {}
+:RLC2 r2 is op=0xa & word1=0xf & reg3=0x0 & r2 {}
+
+:RRC r2 is op=0xe & word1=0x8 & reg3=0x3 & r2 {}
+:INC n is op=0xf & word1=0x6 & n {}
+:DEC n is op=0xf & word1=0x7 & n {}
+:ACPX r2 is op=0xf & word1=0x2 & reg3=0x2 & r2 {}
+:ACPY r2 is op=0xf & word1=0x2 & reg3=0x3 & r2 {}
+:SCPX r2 is op=0xf & word1=0x3 & reg3=0x2 & r2 {}
+:SCPY r2 is op=0xf & word1=0x3 & reg3=0x3 & r2 {}
+:NOT r0 is op=0xd & reg1=0x0 & word2=0xf & r0 {}
 
 
