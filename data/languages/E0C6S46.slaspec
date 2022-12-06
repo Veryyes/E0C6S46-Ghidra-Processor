@@ -3,7 +3,7 @@
 # https://download.epson-europe.com/pub/electronics-de/asmic/4bit/60family/62core_e.pdf
 
 define endian=big;
-define alignment=12;
+define alignment=2;
 
 define space register type=register_space size=2 wordsize=2;
 
