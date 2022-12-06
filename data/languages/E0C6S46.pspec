@@ -1,4 +1,20 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
 <processor_spec>
+	<default_memory_blocks>
+    	<memory_block initialized="false" name="ram" start_address="ram:0x0000" length="0x280" mode="rw"/>
+	</default_memory_blocks>
+	<context_data>
+		<tracked_set space="rom" first="0x0000" last="0x0000">
+			<set name="PCB" val="0x0"/>
+			<set name="PCP" val="0x1"/>
+			<set name="PCS" val="0x0"/>
+			<set name="PC" val="0x100"/>
+			<set name="NBP" val="0x0"/>
+			<set name="NPP" val="0x1"/>
+		</tracked_set>
+	</context_data>
+	<default_symbols>
+		<symbol name="start" address="rom:0x110" type="code" entry="true"/>
+	</default_symbols>
 </processor_spec>

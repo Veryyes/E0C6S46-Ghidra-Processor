@@ -5,4 +5,9 @@
             <output></output>
         </prototype>
     </default_proto>
+    <stackpointer register="SP" space="register" growth="negative"/>
+    <global>
+    	<range space="rom"/>
+    	<range space="ram"/>
+    </global>
 </compiler_spec>
