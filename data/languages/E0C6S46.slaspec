@@ -14,10 +14,12 @@ define space rom type=ram_space size=2 wordsize=2 default;
 define space ram type=ram_space size=2 wordsize=1;
 
 # 160 words x 4 bits
-define space display type=ram_space size=1 wordsize=1;
+# This is referenced like normal RAM, so use size = 2.
+define space display type=ram_space size=2 wordsize=1;
 
 # 48 words x 4 bits
-define space io type=ram_space size=1 wordsize=1; 
+# This is referenced like normal RAM, so use size = 2.
+define space io type=ram_space size=2 wordsize=1; 
 
 #############
 # REGISTERS #
@@ -47,6 +49,9 @@ define register offset=12 size=2 [IX IY SP PC];
 # Since PC is equal to (PCS & 0xFF) | ((PCP & 0xF) << 8) | ((PCB & 0x1) << 12)
 # PC is a 13bit value
 
+# Define virtual register for context. Apparently the size has to be a multiple of 4 bytes.
+define register offset=20 size=4 [ contextreg ];
+
 @define SPH "SP[4,4]"
 @define SPL "SP[0,4]"
 @define XL "IX[0,4]"
@@ -57,6 +62,8 @@ define register offset=12 size=2 [IX IY SP PC];
 @define YH "IY[4,4]"
 @define YP "IY[8,4]"
 @define YHL "IY[0,8]"
+@define MX "*[ram]:1 IX"
+@define MY "*[ram]:1 IY"
 			
 ##########
 # TOKENS #
@@ -92,17 +99,47 @@ define token instr(16)
 	p = (0,4)
 ;
 
+# The behavior of jump instructions changes based on whether the previous
+# instruction was a PSET. To model this, use a context register.
+# The pprev flag only affects the next instruction, so set the "noflow"
+# attribute on it.
+define context contextreg
+  pprev = (1,1) noflow # 1 if the instruction before was a PSET
+;
+
+
 ################
 # INSTRUCTIONS #				
 ################
 
 # Branching Instructions
-:PSET p is op=0xe & three_bit=0x2 & p {
+:PSET p is op=0xe & three_bit=0x2 & p [ pprev = 1; globalset(inst_next, pprev); ] {
 	NBP = (p>>0x4) & 0x1;
 	NPP = p & 0xf;
 }
 
-:JP s is op=0x0 & s {
+# If the previous instruction was a PSET, we can jump to a new bank or page.
+# Otherwise, we can only jump within this page, so set PCB and PCP to THIS instruction's bank and page.
+# This is not documented very consistently in the manual but MAME DOES do it, and I assume its emulation is correct!
+# (1) Ghidra gets all confused if you implement just 1 instruction with a jump in it. So I HAD to use two instructions,
+#     differentiated by a context register. 
+# (2) The dynamic calculations involving inst_start MUST take place in the disassembly section or else you will not get correct results.
+#     I was getting zeros and it was confusing the crap out of me until I RANDOMLY tried using the disassembly section.
+#     The Sleigh manual hints, whispers, intimates, suggests, but does not outright SAY that you must do it like this.
+# (3) Note that I was not able to find a way to make this work without sticking the dynamic operands into the display section,
+#     so that will look ugly on Ghidra.
+:JP s (thisPcb, thisPcp) is op=0x0 & pprev=0 & s [ thisPcp = (inst_start >> 0x8) & 0xf; thisPcb = (inst_start >> 0xc) & 0x1; ] {
+  PCB = thisPcb;
+  PCP = thisPcp;
+	PCS = s;
+	
+	# Holy shit, getting this to properly jump in ghidra decomp took forever
+	PC = 0x0000 | zext(PCS) | zext(PCP) << 0x8 | zext(PCB) << 0xc;
+
+	goto [PC];
+}
+
+:JP s is op=0x0 & pprev=1 & s {
 	PCB = NBP;
 	PCP = NPP;
 	PCS = s;
@@ -113,7 +150,17 @@ define token instr(16)
 	goto [PC];
 }
 
-:JPC s is op=0x2 & s {
+:JPC s (thisPcb, thisPcp) is op=0x2 & pprev=0 & s [ thisPcp = (inst_start >> 0x8) & 0xf; thisPcb = (inst_start >> 0xc) & 0x1; ] {
+	if(C != 1) goto <end>;
+    PCB = thisPcb;
+    PCP = thisPcp;
+		PCS = s;
+		PC = 0x0000 | zext(PCS) | zext(PCP) << 0x8 | zext(PCB) << 0xc;
+		goto [PC];
+	<end>
+}
+
+:JPC s is op=0x2 & pprev=1 & s {
 	if(C != 1) goto <end>;
 		PCB = NBP;
 		PCP = NPP;
@@ -122,7 +169,18 @@ define token instr(16)
 		goto [PC];
 	<end>
 }
-:JPNC s is op=0x3 & s {
+
+:JPNC s (thisPcb, thisPcp) is op=0x3 & pprev=0 & s [ thisPcp = (inst_start >> 0x8) & 0xf; thisPcb = (inst_start >> 0xc) & 0x1; ] {
+	if(C == 1) goto <end>;
+    PCB = thisPcb;
+    PCP = thisPcp;
+		PCS = s;
+		PC = 0x0000 | zext(PCS) | zext(PCP) << 0x8 | zext(PCB) << 0xc;
+		goto [PC];
+	<end>
+}
+
+:JPNC s is op=0x3 & pprev=1 & s {
 	if(C == 1) goto <end>;
 		PCB = NBP;
 		PCP = NPP;
@@ -131,7 +189,18 @@ define token instr(16)
 		goto [PC];
 	<end>
 }
-:JPZ s is op=0x6 & s {
+
+:JPZ s (thisPcb, thisPcp) is op=0x6 & pprev=0 & s [ thisPcp = (inst_start >> 0x8) & 0xf; thisPcb = (inst_start >> 0xc) & 0x1; ] {
+	if(Z != 1) goto <end>;
+    PCB = thisPcb;
+    PCP = thisPcp;
+		PCS = s;
+		PC = 0x0000 | zext(PCS) | zext(PCP) << 0x8 | zext(PCB) << 0xc;
+		goto [PC];
+	<end>
+}
+
+:JPZ s is op=0x6 & pprev=1 & s {
 	if(Z != 1) goto <end>;
 		PCB = NBP;
 		PCP = NPP;
@@ -140,7 +209,18 @@ define token instr(16)
 		goto [PC];
 	<end>
 }
-:JNZ s is op=0x7 & s {
+
+:JNZ s (thisPcb, thisPcp) is op=0x7 & pprev=0 & s [ thisPcp = (inst_start >> 0x8) & 0xf; thisPcb = (inst_start >> 0xc) & 0x1; ] {
+	if(Z == 1) goto <end>;
+    PCB = thisPcb;
+    PCP = thisPcp;
+		PCS = s;
+		PC = 0x0000 | zext(PCS) | zext(PCP) << 0x8 | zext(PCB) << 0xc;
+		goto [PC];
+	<end>
+}
+
+:JNZ s is op=0x7 & pprev=1 & s {
 	if(Z == 1) goto <end>;
 		PCB = NBP;
 		PCP = NPP;
@@ -149,55 +229,83 @@ define token instr(16)
 		goto [PC];
 	<end>
 }
-:JPBA is op=0xf & word1=0xe & word2=0x8 {
-	PCB = NBP;
-	PCP = NPP;
-	PCS = ((B & 0xf) << 0x4) | A & 0xf;
+
+:JPBA (thisPcb, thisPcp) is op=0xf & word1=0xe & word2=0x8 & pprev=0 [ thisPcp = (inst_start >> 0x8) & 0xf; thisPcb = (inst_start >> 0xc) & 0x1; ] {
+  PCB = thisPcb;
+  PCP = thisPcp;
+	PCS = ((B & 0xf) << 0x4) | (A & 0xf);
 	PC = 0x0000 | zext(PCS) | zext(PCP) << 0x8 | zext(PCB) << 0xc;
 	goto [PC];  
 }
 
-:CALL s is op=0x4 & s {
+:JPBA is op=0xf & word1=0xe & word2=0x8 & pprev=1 {
 	PCB = NBP;
+	PCP = NPP;
+	PCS = ((B & 0xf) << 0x4) | (A & 0xf);
+	PC = 0x0000 | zext(PCS) | zext(PCP) << 0x8 | zext(PCB) << 0xc;
+	goto [PC];  
+}
+
+# The call instructions cannot jump between banks; they can only jump between pages in the same bank.
+:CALL s (thisPcb, thisPcp) is op=0x4 & pprev=0 & s [ thisPcp = (inst_start >> 0x8) & 0xf; thisPcb = (inst_start >> 0xc) & 0x1; ] {
 	*[ram]:1 SP-1 = PCP;
 	*[ram]:1 SP-2 = PCS >> 4;
 	*[ram]:1 SP-3 = (PCS & 0xf) + 1;
 	SP = SP - 3;
+  PCB = thisPcb;
+  PCP = thisPcp;
+	PCS = s;
+	PC = 0x0000 | zext(PCS) | zext(PCP) << 0x8 | zext(PCB) << 0xc;
+	call [PC]; 
+}
+
+:CALL s (thisPcb) is op=0x4 & pprev=1 & s [ thisPcb = (inst_start >> 0xc) & 0x1; ] {
+	*[ram]:1 SP-1 = PCP;
+	*[ram]:1 SP-2 = PCS >> 4;
+	*[ram]:1 SP-3 = (PCS & 0xf) + 1;
+	SP = SP - 3;
+  PCB = thisPcb;
 	PCP = NPP;
 	PCS = s;
 	PC = 0x0000 | zext(PCS) | zext(PCP) << 0x8 | zext(PCB) << 0xc;
 	call [PC]; 
 }
 
-:CALZ s is op=0x5 & s {
-	PCB = NBP;
+:CALZ s (thisPcb) is op=0x5 & s [ thisPcb = (inst_start >> 0xc) & 0x1; ] {
 	*[ram]:1 SP-1 = PCP;
 	*[ram]:1 SP-2 = PCS >> 4;
 	*[ram]:1 SP-3 = (PCS & 0xf) + 1;
 	SP = SP - 3;
+  PCB = thisPcb;
 	PCP = 0x0;
 	PCS = s;
 	PC = 0x0000 | zext(PCS) | zext(PCP) << 0x8 | zext(PCB) << 0xc;
 	call [PC];
 }
-:RET is op=0xf & word1=0xd & word2=0xf {
+
+:RET (thisPcb) is op=0xf & word1=0xd & word2=0xf [ thisPcb = (inst_start >> 0xc) & 0x1; ] {
 	PCS = (*[ram]:1 SP) | ((*[ram]:1 (SP+1)) << 4);
 	PCP = *[ram]:1 SP+2;
+  PCB = thisPcb;
 	SP = SP+3;
 	PC = 0x0000 | zext(PCS) | zext(PCP) << 0x8 | zext(PCB) << 0xc;
 	return [PC];
 }
-:RETS is op=0xf & word1=0xd & word2=0xe {
+
+:RETS (thisPcb) is op=0xf & word1=0xd & word2=0xe [ thisPcb = (inst_start >> 0xc) & 0x1; ] {
 	PCS = (*[ram]:1 SP) | ((*[ram]:1 (SP+1)) << 4);
 	PCP = *[ram]:1 SP+2;
+  PCB = thisPcb;
 	SP = SP+3;
 	PC = 0x0000 | zext(PCS) | zext(PCP) << 0x8 | zext(PCB) << 0xc;
 	PC = PC + 1;
 	return [PC];
 }
-:RETD l is op=0x1 & l{
+
+:RETD l (thisPcb) is op=0x1 & l [ thisPcb = (inst_start >> 0xc) & 0x1; ] {
 	PCS = (*[ram]:1 SP) | ((*[ram]:1 (SP+1)) << 4);
 	PCP = *[ram]:1 SP+2;
+  PCB = thisPcb;
 	SP = SP+3;
 	PC = 0x0000 | zext(PCS) | zext(PCP) << 0x8 | zext(PCB) << 0xc;
 	*[ram]:1 IX = l & 0xf;
@@ -209,13 +317,15 @@ define token instr(16)
 # Sys Control Instructions
 :NOP5 is op=0xf & word1=0xf & word2=0xb {}
 :NOP7 is op=0xf & word1=0xf & word2=0xf {}
-:HALT is op=0xf & word1=0xf & word2=0x8 {}
+# Other processors packaged with Ghidra goto the current instruction on a halt.
+# We will do that too.
+:HALT is op=0xf & word1=0xf & word2=0x8 { goto inst_start; }
 
 # Index Operation Instructions
-:INCX is op=0xe & word1=0xe & word2=0x0 { IX = IX + 1;}
-:INCY is op=0xe & word1=0xf & word2=0x0 { IY = IY + 1;}
-:LDX x is op=0xb & x { IX = IX & 0xf0 | x;}
-:LDY y is op=0x8 & y { IY = IY & 0xf0 | y;}
+:INCX is op=0xe & word1=0xe & word2=0x0 { IX = IX + 1; }
+:INCY is op=0xe & word1=0xf & word2=0x0 { IY = IY + 1; }
+:LDX x is op=0xb & x { IX = (IX & 0xf00) | x;}
+:LDY y is op=0x8 & y { IY = (IY & 0xf00) | y;}
 #:LDXP r2 is op=0xe & word1=0x8 & reg3=0x0 & r2 {
 #	selector:1 = r2;
 #	if (selector == 0x0) goto <a>;
@@ -237,10 +347,18 @@ define token instr(16)
 #	<end>
 #}
 
-:LD_XP_A is op=0xe & word1=0x8 & reg3=0x0 & reg4=0x0 {}
-:LD_XP_B is op=0xe & word1=0x8 & reg3=0x0 & reg4=0x1 {}
-:LD_XP_X is op=0xe & word1=0x8 & reg3=0x0 & reg4=0x2 {}
-:LD_XP_Y is op=0xe & word1=0x8 & reg3=0x0 & reg4=0x3 {}
+:LD_XP_A is op=0xe & word1=0x8 & reg3=0x0 & reg4=0x0 {
+  $(XP) = (A & 0xf);
+}
+:LD_XP_B is op=0xe & word1=0x8 & reg3=0x0 & reg4=0x1 {
+  $(XP) = (B & 0xf);
+}
+:LD_XP_MX is op=0xe & word1=0x8 & reg3=0x0 & reg4=0x2 {
+  $(XP) = $(MX);
+}
+:LD_XP_MY is op=0xe & word1=0x8 & reg3=0x0 & reg4=0x3 {
+  $(XP) = $(MY);
+}
 
 #:LDXH r2 is op=0xe & word1=0x8 & reg3=0x1 & r2 {}
 #:LDXL r2 is op=0xe & word1=0x8 & reg3=0x2 & r2 {}
@@ -253,128 +371,382 @@ define token instr(16)
 #:LDYP r2 is op=0xe & word1=0xb & reg3=0x0 & r2 {}
 #:LDYH r2 is op=0xe & word1=0xb & reg3=0x1 & r2 {}
 #:LDYL r2 is op=0xe & word1=0xb & reg3=0x2 & r2 {}
-:LD_XH_A is op=0xe & word1=0x8 & reg3=0x1 & reg4=0x0 {}
-:LD_XH_B is op=0xe & word1=0x8 & reg3=0x1 & reg4=0x1 {}
-:LD_XH_MX is op=0xe & word1=0x8 & reg3=0x1 & reg4=0x2 {}
-:LD_XH_MY is op=0xe & word1=0x8 & reg3=0x1 & reg4=0x3 {}
-:LD_XL_A is op=0xe & word1=0x8 & reg3=0x2 & reg4=0x0 {}
-:LD_XL_B is op=0xe & word1=0x8 & reg3=0x2 & reg4=0x1 {}
-:LD_XL_MX is op=0xe & word1=0x8 & reg3=0x2 & reg4=0x2 {}
-:LD_XL_MY is op=0xe & word1=0x8 & reg3=0x2 & reg4=0x3 {}
-:LD_YP_A is op=0xe & word1=0x9 & reg3=0x0 & reg4=0x0 {}
-:LD_YP_B is op=0xe & word1=0x9 & reg3=0x0 & reg4=0x1 {}
-:LD_YP_MX is op=0xe & word1=0x9 & reg3=0x0 & reg4=0x2 {}
-:LD_YP_MY is op=0xe & word1=0x9 & reg3=0x0 & reg4=0x3 {}
-:LD_YH_A is op=0xe & word1=0x9 & reg3=0x1 & reg4=0x0 {}
-:LD_YH_B is op=0xe & word1=0x9 & reg3=0x1 & reg4=0x1 {}
-:LD_YH_MX is op=0xe & word1=0x9 & reg3=0x1 & reg4=0x2 {}
-:LD_YH_MY is op=0xe & word1=0x9 & reg3=0x1 & reg4=0x3 {}
-:LD_YL_A is op=0xe & word1=0x9 & reg3=0x2 & reg4=0x0 {}
-:LD_YL_B is op=0xe & word1=0x9 & reg3=0x2 & reg4=0x1 {}
-:LD_YL_MX is op=0xe & word1=0x9 & reg3=0x2 & reg4=0x2 {}
-:LD_YL_MY is op=0xe & word1=0x9 & reg3=0x2 & reg4=0x3 {}
-:LD_XP_A is op=0xe & word1=0xa & reg3=0x0 & reg4=0x0 {}
-:LD_XP_B is op=0xe & word1=0xa & reg3=0x0 & reg4=0x1 {}
-:LD_XP_MX is op=0xe & word1=0xa & reg3=0x0 & reg4=0x2 {}
-:LD_XP_MY is op=0xe & word1=0xa & reg3=0x0 & reg4=0x3 {}
-:LD_XH_A is op=0xe & word1=0xa & reg3=0x1 & reg4=0x0 {}
-:LD_XH_B is op=0xe & word1=0xa & reg3=0x1 & reg4=0x1 {}
-:LD_XH_MX is op=0xe & word1=0xa & reg3=0x1 & reg4=0x2 {}
-:LD_XH_MY is op=0xe & word1=0xa & reg3=0x1 & reg4=0x3 {}
-:LD_XL_A is op=0xe & word1=0xa & reg3=0x2 & reg4=0x0 {}
-:LD_XL_B is op=0xe & word1=0xa & reg3=0x2 & reg4=0x1 {}
-:LD_XL_MX is op=0xe & word1=0xa & reg3=0x2 & reg4=0x2 {}
-:LD_XL_MY is op=0xe & word1=0xa & reg3=0x2 & reg4=0x3 {}
-:LD_YP_A is op=0xe & word1=0xb & reg3=0x0 & reg4=0x0 {}
-:LD_YP_B is op=0xe & word1=0xb & reg3=0x0 & reg4=0x1 {}
-:LD_YP_MX is op=0xe & word1=0xb & reg3=0x0 & reg4=0x2 {}
-:LD_YP_MY is op=0xe & word1=0xb & reg3=0x0 & reg4=0x3 {}
-:LD_YH_A is op=0xe & word1=0xb & reg3=0x1 & reg4=0x0 {}
-:LD_YH_B is op=0xe & word1=0xb & reg3=0x1 & reg4=0x1 {}
-:LD_YH_MX is op=0xe & word1=0xb & reg3=0x1 & reg4=0x2 {}
-:LD_YH_MY is op=0xe & word1=0xb & reg3=0x1 & reg4=0x3 {}
-:LD_YL_A is op=0xe & word1=0xb & reg3=0x2 & reg4=0x0 {}
-:LD_YL_B is op=0xe & word1=0xb & reg3=0x2 & reg4=0x1 {}
-:LD_YL_MX is op=0xe & word1=0xb & reg3=0x2 & reg4=0x2 {}
-:LD_YL_MY is op=0xe & word1=0xb & reg3=0x2 & reg4=0x3 {}
-:ADCXH i is op=0xa & word1=0x0 & i {}
-:ADCXL i is op=0xa & word1=0x1 & i {}
-:ADCYH i is op=0xa & word1=0x2 & i {}
-:ADCYL i is op=0xa & word1=0x3 & i {}
-:CPXH i is op=0xa & word1=0x4 & i {}
-:CPXL i is op=0xa & word1=0x5 & i {}
-:CPYH i is op=0xa & word1=0x6 & i {}
-:CPYL i is op=0xa & word1=0x7 & i {}
+:LD_XH_A is op=0xe & word1=0x8 & reg3=0x1 & reg4=0x0 {
+  $(XH) = (A & 0xf);
+}
+:LD_XH_B is op=0xe & word1=0x8 & reg3=0x1 & reg4=0x1 {
+  $(XH) = (B & 0xf);
+}
+:LD_XH_MX is op=0xe & word1=0x8 & reg3=0x1 & reg4=0x2 {
+  $(XH) = $(MX);
+}
+:LD_XH_MY is op=0xe & word1=0x8 & reg3=0x1 & reg4=0x3 {
+  $(XH) = $(MY);
+}
+:LD_XL_A is op=0xe & word1=0x8 & reg3=0x2 & reg4=0x0 {
+  $(XL) = (A & 0xf);
+}
+:LD_XL_B is op=0xe & word1=0x8 & reg3=0x2 & reg4=0x1 {
+  $(XL) = (B & 0xf);
+}
+:LD_XL_MX is op=0xe & word1=0x8 & reg3=0x2 & reg4=0x2 {
+  $(XL) = $(MX);
+}
+:LD_XL_MY is op=0xe & word1=0x8 & reg3=0x2 & reg4=0x3 {
+  $(XL) = $(MY);
+}
+:LD_YP_A is op=0xe & word1=0x9 & reg3=0x0 & reg4=0x0 {
+  $(YP) = (A & 0xf);
+}
+:LD_YP_B is op=0xe & word1=0x9 & reg3=0x0 & reg4=0x1 {
+  $(YP) = (B & 0xf);
+}
+:LD_YP_MX is op=0xe & word1=0x9 & reg3=0x0 & reg4=0x2 {
+  $(YP) = $(MX);
+}
+:LD_YP_MY is op=0xe & word1=0x9 & reg3=0x0 & reg4=0x3 {
+  $(YP) = $(MY);
+}
+:LD_YH_A is op=0xe & word1=0x9 & reg3=0x1 & reg4=0x0 {
+  $(YH) = (A & 0xf);
+}
+:LD_YH_B is op=0xe & word1=0x9 & reg3=0x1 & reg4=0x1 {
+  $(YH) = (B & 0xf);
+}
+:LD_YH_MX is op=0xe & word1=0x9 & reg3=0x1 & reg4=0x2 {
+  $(YH) = $(MX);
+}
+:LD_YH_MY is op=0xe & word1=0x9 & reg3=0x1 & reg4=0x3 {
+  $(YH) = $(MY);
+}
+:LD_YL_A is op=0xe & word1=0x9 & reg3=0x2 & reg4=0x0 {
+  $(YL) = (A & 0xf);
+}
+:LD_YL_B is op=0xe & word1=0x9 & reg3=0x2 & reg4=0x1 {
+  $(YL) = (B & 0xf);
+}
+:LD_YL_MX is op=0xe & word1=0x9 & reg3=0x2 & reg4=0x2 {
+  $(YL) = $(MX);
+}
+:LD_YL_MY is op=0xe & word1=0x9 & reg3=0x2 & reg4=0x3 {
+  $(YL) = $(MY);
+}
+
+macro setAddCCarryFlag(result) {
+  C = (result & 0x10) != 0;
+}
+
+macro setZeroFlag(result) {
+  Z = (result & 0xf) == 0;
+}
+
+# These instructions do NOT behave differently in
+# decimal mode.
+:ADCXH i is op=0xa & word1=0x0 & i {
+  local tmp = $(XH) + i + C;
+  $(XH) = (tmp & 0xf);
+  setAddCCarryFlag(tmp);
+  setZeroFlag(tmp);
+}
+:ADCXL i is op=0xa & word1=0x1 & i {
+  local tmp = $(XL) + i + C;
+  $(XL) = (tmp & 0xf);
+  setAddCCarryFlag(tmp);
+  setZeroFlag(tmp);
+}
+:ADCYH i is op=0xa & word1=0x2 & i {
+  local tmp = $(YH) + i + C;
+  $(YH) = (tmp & 0xf);
+  setAddCCarryFlag(tmp);
+  setZeroFlag(tmp);
+}
+:ADCYL i is op=0xa & word1=0x3 & i {
+  local tmp = $(YL) + i + C;
+  $(YL) = (tmp & 0xf);
+  setAddCCarryFlag(tmp);
+  setZeroFlag(tmp);
+}
+:CPXH i is op=0xa & word1=0x4 & i {
+  C = $(XH) < i;
+  Z = $(XH) == i;
+}
+:CPXL i is op=0xa & word1=0x5 & i {
+  C = $(XL) < i;
+  Z = $(XL) == i;
+}
+:CPYH i is op=0xa & word1=0x6 & i {
+  C = $(YH) < i;
+  Z = $(YH) == i;
+}
+:CPYL i is op=0xa & word1=0x7 & i {
+  C = $(YL) < i;
+  Z = $(YL) == i;
+}
 
 # Data Transfer Instructions
 #:LD r0,i is op=0xe & reg1=0x0 & r0 & i {}
-:LD_A i is op=0xe & reg1=0x0 & reg2=0x0 & i {}
-:LD_B i is op=0xe & reg1=0x0 & reg2=0x1 & i {}
-:LD_MX i is op=0xe & reg1=0x0 & reg2=0x2 & i {}
-:LD_MY i is op=0xe & reg1=0x0 & reg2=0x3 & i {}
+:LD_A i is op=0xe & reg1=0x0 & reg2=0x0 & i {
+  A = (i & 0xf);
+}
+:LD_B i is op=0xe & reg1=0x0 & reg2=0x1 & i {
+  B = (i & 0xf);
+}
+:LD_MX i is op=0xe & reg1=0x0 & reg2=0x2 & i {
+  $(MX) = (i & 0xf);
+}
+:LD_MY i is op=0xe & reg1=0x0 & reg2=0x3 & i {
+  $(MY) = (i & 0xf);
+}
 #:LD r1,q is op=0xe & word1=0xc & r1 & q {}
 #:LD_A_A is op=0xe & word1=0xc & reg3=0x0 & reg4=0x0 {}
-:LD_A_B is op=0xe & word1=0xc & reg3=0x0 & reg4=0x1 {}
-:LD_A_MX is op=0xe & word1=0xc & reg3=0x0 & reg4=0x2 {}
-:LD_A_MY is op=0xe & word1=0xc & reg3=0x0 & reg4=0x3 {}
-:LD_B_A is op=0xe & word1=0xc & reg3=0x1 & reg4=0x0 {}
+:LD_A_B is op=0xe & word1=0xc & reg3=0x0 & reg4=0x1 {
+  A = B;
+}
+:LD_A_MX is op=0xe & word1=0xc & reg3=0x0 & reg4=0x2 {
+  A = $(MX);
+}
+:LD_A_MY is op=0xe & word1=0xc & reg3=0x0 & reg4=0x3 {
+  A = $(MY);
+}
+:LD_B_A is op=0xe & word1=0xc & reg3=0x1 & reg4=0x0 {
+  B = A;
+}
 #:LD_B_B is op=0xe & word1=0xc & reg3=0x1 & reg4=0x1 {}
-:LD_B_MX is op=0xe & word1=0xc & reg3=0x1 & reg4=0x2 {}
-:LD_B_MY is op=0xe & word1=0xc & reg3=0x1 & reg4=0x3 {}
-:LD_MX_A is op=0xe & word1=0xc & reg3=0x2 & reg4=0x0 {}
-:LD_MX_B is op=0xe & word1=0xc & reg3=0x2 & reg4=0x1 {}
+:LD_B_MX is op=0xe & word1=0xc & reg3=0x1 & reg4=0x2 {
+  B = $(MX);
+}
+:LD_B_MY is op=0xe & word1=0xc & reg3=0x1 & reg4=0x3 {
+  B = $(MY);
+}
+:LD_MX_A is op=0xe & word1=0xc & reg3=0x2 & reg4=0x0 {
+  $(MX) = A;
+}
+:LD_MX_B is op=0xe & word1=0xc & reg3=0x2 & reg4=0x1 {
+  $(MX) = B;
+}
 #:LD_MX_MX is op=0xe & word1=0xc & reg3=0x2 & reg4=0x2 {}
-:LD_MX_MY is op=0xe & word1=0xc & reg3=0x2 & reg4=0x3 {}
-:LD_MY_A is op=0xe & word1=0xc & reg3=0x3 & reg4=0x0 {}
-:LD_MY_B is op=0xe & word1=0xc & reg3=0x3 & reg4=0x1 {}
-:LD_MY_MX is op=0xe & word1=0xc & reg3=0x3 & reg4=0x2 {}
+:LD_MX_MY is op=0xe & word1=0xc & reg3=0x2 & reg4=0x3 {
+  $(MX) = $(MY);
+}
+:LD_MY_A is op=0xe & word1=0xc & reg3=0x3 & reg4=0x0 {
+  $(MY) = A;
+}
+:LD_MY_B is op=0xe & word1=0xc & reg3=0x3 & reg4=0x1 {
+  $(MY) = B;
+}
+:LD_MY_MX is op=0xe & word1=0xc & reg3=0x3 & reg4=0x2 {
+  $(MY) = $(MX);
+}
 #:LD_MY_MY is op=0xe & word1=0xc & reg3=0x3 & reg4=0x3 {}
 
-:LDA n is op=0xf & word1=0xa & n {}
-:LDB n is op=0xf & word1=0xb & n {}
+:LD_A_XP is op=0xe & word1=0xa & reg3=0x0 & reg4=0x0 {
+  A = $(XP);
+}
+:LD_B_XP is op=0xe & word1=0xa & reg3=0x0 & reg4=0x1 {
+  B = $(XP);
+}
+:LD_MX_XP is op=0xe & word1=0xa & reg3=0x0 & reg4=0x2 {
+  $(MX) = $(XP);
+}
+:LD_MY_XP is op=0xe & word1=0xa & reg3=0x0 & reg4=0x3 {
+  $(MY) = $(XP);
+}
+:LD_A_XH is op=0xe & word1=0xa & reg3=0x1 & reg4=0x0 {
+  A = $(XH);
+}
+:LD_B_XH is op=0xe & word1=0xa & reg3=0x1 & reg4=0x1 {
+  B = $(XH);
+}
+:LD_MX_XH is op=0xe & word1=0xa & reg3=0x1 & reg4=0x2 {
+  $(MX) = $(XH);
+}
+:LD_MY_XH is op=0xe & word1=0xa & reg3=0x1 & reg4=0x3 {
+  $(MY) = $(XH);
+}
+:LD_A_XL is op=0xe & word1=0xa & reg3=0x2 & reg4=0x0 {
+  A = $(XL);
+}
+:LD_B_XL is op=0xe & word1=0xa & reg3=0x2 & reg4=0x1 {
+  B = $(XL);
+}
+:LD_MX_XL is op=0xe & word1=0xa & reg3=0x2 & reg4=0x2 {
+  $(MX) = $(XL);
+}
+:LD_MY_XL is op=0xe & word1=0xa & reg3=0x2 & reg4=0x3 {
+  $(MY) = $(XL);
+}
+:LD_A_YP is op=0xe & word1=0xb & reg3=0x0 & reg4=0x0 {
+  A = $(YP);
+}
+:LD_B_YP is op=0xe & word1=0xb & reg3=0x0 & reg4=0x1 {
+  B = $(YP);
+}
+:LD_MX_YP is op=0xe & word1=0xb & reg3=0x0 & reg4=0x2 {
+  $(MX) = $(YP);
+}
+:LD_MY_YP is op=0xe & word1=0xb & reg3=0x0 & reg4=0x3 {
+  $(MY) = $(YP);
+}
+:LD_A_YH is op=0xe & word1=0xb & reg3=0x1 & reg4=0x0 {
+  A = $(YH);
+}
+:LD_B_YH is op=0xe & word1=0xb & reg3=0x1 & reg4=0x1 {
+  B = $(YH);
+}
+:LD_MX_YH is op=0xe & word1=0xb & reg3=0x1 & reg4=0x2 {
+  $(MX) = $(YH);
+}
+:LD_MY_YH is op=0xe & word1=0xb & reg3=0x1 & reg4=0x3 {
+  $(MY) = $(YH);
+}
+:LD_A_YL is op=0xe & word1=0xb & reg3=0x2 & reg4=0x0 {
+  A = $(YL);
+}
+:LD_B_YL is op=0xe & word1=0xb & reg3=0x2 & reg4=0x1 {
+  B = $(YL);
+}
+:LD_MX_YL is op=0xe & word1=0xb & reg3=0x2 & reg4=0x2 {
+  $(MX) = $(YL);
+}
+:LD_MY_YL is op=0xe & word1=0xb & reg3=0x2 & reg4=0x3 {
+  $(MY) = $(YL);
+}
+
+:LDA n is op=0xf & word1=0xa & n {
+  A = *[ram]:1 n:2;
+}
+:LDB n is op=0xf & word1=0xb & n {
+  B = *[ram]:1 n:2;
+}
 # LD Mn, A
-:SWA n is op=0xf & word1=0x8 & n {}
+:LD_MN_A n is op=0xf & word1=0x8 & n {
+  *[ram]:1 n:2 = A;
+}
 # LD Mn, B
-:SWB n is op=0xf & word1=0x9 & n {}
-:LDPX_MX i is op=0xe & word1=0x6 & i {}
+:LD_MN_B n is op=0xf & word1=0x9 & n {
+  *[ram]:1 n:2 = B;
+}
+:LDPX_MX i is op=0xe & word1=0x6 & i {
+  $(MX) = i;
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
 #:LDPX r1,q is op=0xe & word1=0xe & r1 & q {}
 #:LDPX_A_A is op=0xe & word1=0xe & reg3=0 & reg4=0 {}
-:LDPX_A_B is op=0xe & word1=0xe & reg3=0 & reg4=1 {}
-:LDPX_A_MX is op=0xe & word1=0xe & reg3=0 & reg4=2 {}
-:LDPX_A_MY is op=0xe & word1=0xe & reg3=0 & reg4=3 {}
-:LDPX_B_A is op=0xe & word1=0xe & reg3=1 & reg4=0 {}
+:LDPX_A_B is op=0xe & word1=0xe & reg3=0 & reg4=1 {
+  A = B;
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
+:LDPX_A_MX is op=0xe & word1=0xe & reg3=0 & reg4=2 {
+  A = $(MX);
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
+:LDPX_A_MY is op=0xe & word1=0xe & reg3=0 & reg4=3 {
+  A = $(MY);
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
+:LDPX_B_A is op=0xe & word1=0xe & reg3=1 & reg4=0 {
+  B = A;
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
 #:LDPX_B_B is op=0xe & word1=0xe & reg3=1 & reg4=1 {}
-:LDPX_B_MX is op=0xe & word1=0xe & reg3=1 & reg4=2 {}
-:LDPX_B_MY is op=0xe & word1=0xe & reg3=1 & reg4=3 {}
-:LDPX_MX_A is op=0xe & word1=0xe & reg3=2 & reg4=0 {}
-:LDPX_MX_B is op=0xe & word1=0xe & reg3=2 & reg4=1 {}
+:LDPX_B_MX is op=0xe & word1=0xe & reg3=1 & reg4=2 {
+  B = $(MX);
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
+:LDPX_B_MY is op=0xe & word1=0xe & reg3=1 & reg4=3 {
+  B = $(MY);
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
+:LDPX_MX_A is op=0xe & word1=0xe & reg3=2 & reg4=0 {
+  $(MX) = A;
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
+:LDPX_MX_B is op=0xe & word1=0xe & reg3=2 & reg4=1 {
+  $(MX) = B;
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
 #:LDPX_MX_MX is op=0xe & word1=0xe & reg3=2 & reg4=2 {}
-:LDPX_MX_MY is op=0xe & word1=0xe & reg3=2 & reg4=3 {}
-:LDPX_MY_A is op=0xe & word1=0xe & reg3=3 & reg4=0 {}
-:LDPX_MY_B is op=0xe & word1=0xe & reg3=3 & reg4=1 {}
-:LDPX_MY_MX is op=0xe & word1=0xe & reg3=3 & reg4=2 {}
+:LDPX_MX_MY is op=0xe & word1=0xe & reg3=2 & reg4=3 {
+  $(MX) = $(MY);
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
+:LDPX_MY_A is op=0xe & word1=0xe & reg3=3 & reg4=0 {
+  $(MY) = A;
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
+:LDPX_MY_B is op=0xe & word1=0xe & reg3=3 & reg4=1 {
+  $(MY) = B;
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
+:LDPX_MY_MX is op=0xe & word1=0xe & reg3=3 & reg4=2 {
+  $(MY) = $(MX);
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
 #:LDPX_MY_MY is op=0xe & word1=0xe & reg3=3 & reg4=3 {}
 
-:LDPY_MY i is op=0xe & word1=0x7 & i {}
+:LDPY_MY i is op=0xe & word1=0x7 & i {
+  $(MY) = i;
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
 #:LDPY r1,q is op=0xe & word1=0xf & r1 & q {}
 #:LDPY_A_A is op=0xe & word1=0xf & reg3=0 & reg4=0 {}
-:LDPY_A_B is op=0xe & word1=0xf & reg3=0 & reg4=1 {}
-:LDPY_A_MX is op=0xe & word1=0xf & reg3=0 & reg4=2 {}
-:LDPY_A_MY is op=0xe & word1=0xf & reg3=0 & reg4=3 {}
-:LDPY_B_A is op=0xe & word1=0xf & reg3=1 & reg4=0 {}
+:LDPY_A_B is op=0xe & word1=0xf & reg3=0 & reg4=1 {
+  A = B;
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
+:LDPY_A_MX is op=0xe & word1=0xf & reg3=0 & reg4=2 {
+  A = $(MX);
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
+:LDPY_A_MY is op=0xe & word1=0xf & reg3=0 & reg4=3 {
+  A = $(MY);
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
+:LDPY_B_A is op=0xe & word1=0xf & reg3=1 & reg4=0 {
+  B = A;
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
 #:LDPY_B_B is op=0xe & word1=0xf & reg3=1 & reg4=1 {}
-:LDPY_B_MX is op=0xe & word1=0xf & reg3=1 & reg4=2 {}
-:LDPY_B_MY is op=0xe & word1=0xf & reg3=1 & reg4=3 {}
-:LDPY_MX_A is op=0xe & word1=0xf & reg3=2 & reg4=0 {}
-:LDPY_MX_B is op=0xe & word1=0xf & reg3=2 & reg4=1 {}
+:LDPY_B_MX is op=0xe & word1=0xf & reg3=1 & reg4=2 {
+  B = $(MX);
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
+:LDPY_B_MY is op=0xe & word1=0xf & reg3=1 & reg4=3 {
+  B = $(MY);
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
+:LDPY_MX_A is op=0xe & word1=0xf & reg3=2 & reg4=0 {
+  $(MX) = A;
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
+:LDPY_MX_B is op=0xe & word1=0xf & reg3=2 & reg4=1 {
+  $(MX) = B;
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
 #:LDPY_MX_MX is op=0xe & word1=0xf & reg3=2 & reg4=2 {}
-:LDPY_MX_MY is op=0xe & word1=0xf & reg3=2 & reg4=3 {}
-:LDPY_MY_A is op=0xe & word1=0xf & reg3=3 & reg4=0 {}
-:LDPY_MY_B is op=0xe & word1=0xf & reg3=3 & reg4=1 {}
-:LDPY_MY_MX is op=0xe & word1=0xf & reg3=3 & reg4=2 {}
+:LDPY_MX_MY is op=0xe & word1=0xf & reg3=2 & reg4=3 {
+  $(MX) = $(MY);
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
+:LDPY_MY_A is op=0xe & word1=0xf & reg3=3 & reg4=0 {
+  $(MY) = A;
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
+:LDPY_MY_B is op=0xe & word1=0xf & reg3=3 & reg4=1 {
+  $(MY) = B;
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
+:LDPY_MY_MX is op=0xe & word1=0xf & reg3=3 & reg4=2 {
+  $(MY) = $(MX);
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
 #:LDPY_MY_MY is op=0xe & word1=0xf & reg3=3 & reg4=3 {}
 
-:LBPX l is op=0x9 & l {}
+:LBPX l is op=0x9 & l {
+  $(MX) = (l & 0xf);
+  *[ram]:1 IX+1 = (l >> 4) & 0xf;
+  $(XHL) = ($(XHL) + 2) & 0xff;
+}
 
 # Flag Operation Instructions
 # F = I D Z C
@@ -390,353 +762,811 @@ define token instr(16)
 	Z = Z & (i>>1 & 0x1);
 	C = C & (i & 0x1);
 }
-:SCF is op=0xf & word1=0x4 & word2=0x1 { C = 1;}
-:RCF is op=0xf & word1=0x5 & word2=0xe { C = 0;}
-:SZF is op=0xf & word1=0x4 & word2=0x2 { Z = 1;}
-:RZF is op=0xf & word1=0x5 & word2=0xd { Z = 0;}
-:SDF is op=0xf & word1=0x4 & word2=0x4 { D = 1;}
-:RDF is op=0xf & word1=0x5 & word2=0xb { D = 0;}
-:EI is op=0xf & word1=0x4 & word2=0x8 {I = 1;}
-:DI is op=0xf & word1=0x5 & word2=0x7 {I = 0;}
+:SCF is op=0xf & word1=0x4 & word2=0x1 { C = 1; }
+:RCF is op=0xf & word1=0x5 & word2=0xe { C = 0; }
+:SZF is op=0xf & word1=0x4 & word2=0x2 { Z = 1; }
+:RZF is op=0xf & word1=0x5 & word2=0xd { Z = 0; }
+:SDF is op=0xf & word1=0x4 & word2=0x4 { D = 1; }
+:RDF is op=0xf & word1=0x5 & word2=0xb { D = 0; }
+:EI is op=0xf & word1=0x4 & word2=0x8 { I = 1; }
+:DI is op=0xf & word1=0x5 & word2=0x7 { I = 0; }
 
 # Stack Operation Instructions
-:INC is op=0xf & word1=0xd & word2=0xb {SP = SP + 1;}
-:DEC is op=0xf & word1=0xc & word2=0xb {SP = SP - 1;}
+# Account for possible overflow,
+# since the Sleigh defines SP as 2-bytes.
+:INC is op=0xf & word1=0xd & word2=0xb {
+  SP = (SP + 1) & 0xff;
+}
+:DEC is op=0xf & word1=0xc & word2=0xb {
+  SP = (SP - 1) & 0xff;
+}
 #:PUSH r2 is op=0xf & word1=0xc & reg3=0x0 & r2 {
 #	SP = SP - 1;
 #	# TODO save value onto stack
 #}
 :PUSH_A is op=0xf & word1=0xc & reg3=0x0 & reg4=0x0 {
-        SP = SP - 1;
-        # TODO save value onto stack
+  SP = (SP - 1) & 0xff;
+  *[ram]:1 SP = A;
 }
 :PUSH_B is op=0xf & word1=0xc & reg3=0x0 & reg4=0x1 {
-        SP = SP - 1;
-        # TODO save value onto stack
+  SP = (SP - 1) & 0xff;
+  *[ram]:1 SP = B;
 }
 :PUSH_MX is op=0xf & word1=0xc & reg3=0x0 & reg4=0x2 {
-        SP = SP - 1;
-        # TODO save value onto stack
+  SP = (SP - 1) & 0xff;
+  *[ram]:1 SP = $(MX);
 }
 :PUSH_MY is op=0xf & word1=0xc & reg3=0x0 & reg4=0x3 {
-        SP = SP - 1;
-        # TODO save value onto stack
+  SP = (SP - 1) & 0xff;
+  *[ram]:1 SP = $(MY);
 }
 
 :PUSHXP is op=0xf & word1=0xc & word2=0x4 {
-	SP = SP - 1;
-	# TODO save value onto stack
+  SP = (SP - 1) & 0xff;
+  *[ram]:1 SP = $(XP);
 }
 :PUSHXH is op=0xf & word1=0xc & word2=0x5 {
-	SP = SP - 1;
-	# TODO save value onto stack
+  SP = (SP - 1) & 0xff;
+  *[ram]:1 SP = $(XH);
 }
 :PUSHXL is op=0xf & word1=0xc & word2=0x6 {
-	SP = SP - 1;
-	# TODO save value onto stack
+  SP = (SP - 1) & 0xff;
+  *[ram]:1 SP = $(XL);
 }
 :PUSHYP is op=0xf & word1=0xc & word2=0x7 {
-	SP = SP - 1;
-	# TODO save value onto stack
+  SP = (SP - 1) & 0xff;
+  *[ram]:1 SP = $(YP);
 }
 :PUSHYH is op=0xf & word1=0xc & word2=0x8 {
-	SP = SP - 1;
-	# TODO save value onto stack
+  SP = (SP - 1) & 0xff;
+  *[ram]:1 SP = $(YH);
 }
 :PUSHYL is op=0xf & word1=0xc & word2=0x9 {
-	SP = SP - 1;
-	# TODO save value onto stack
+  SP = (SP - 1) & 0xff;
+  *[ram]:1 SP = $(YL);
 }
 :PUSHF is op=0xf & word1=0xc & word2=0xa {
-	# TODO read value from stack
-	SP = SP + 1;
+  SP = (SP - 1) & 0xff;
+  *[ram]:1 SP = (I << 3) | (D << 2) | (Z << 1) | C;
 }
 #:POP r2 is op=0xf & word1=0xd & reg3=0x0 & r2 {
 #	# TODO read value from stack
 #	SP = SP + 1;
 #}
 :POP_A is op=0xf & word1=0xd & reg3=0x0 & reg4=0x0 {
-        # TODO read value from stack
-        SP = SP + 1;
+  A = *[ram]:1 SP;
+  SP = (SP + 1) & 0xff;
 }
 :POP_B is op=0xf & word1=0xd & reg3=0x0 & reg4=0x1 {
-        # TODO read value from stack
-        SP = SP + 1;
+  B = *[ram]:1 SP;
+  SP = (SP + 1) & 0xff;
 }
 :POP_MX is op=0xf & word1=0xd & reg3=0x0 & reg4=0x2 {
-        # TODO read value from stack
-        SP = SP + 1;
+  $(MX) = *[ram]:1 SP;
+  SP = (SP + 1) & 0xff;
 }
 :POP_MY is op=0xf & word1=0xd & reg3=0x0 & reg4=0x3 {
-        # TODO read value from stack
-        SP = SP + 1;
+  $(MY) = *[ram]:1 SP;
+  SP = (SP + 1) & 0xff;
 }
 
 :POPXP is op=0xf & word1=0xd & word2=0x4 {
-	# TODO read value from stack
-	SP = SP + 1;
+  $(XP) = *[ram]:1 SP;
+  SP = (SP + 1) & 0xff;
 }
 :POPXH is op=0xf & word1=0xd & word2=0x5 {
-	# TODO read value from stack
-	SP = SP + 1;
+  $(XH) = *[ram]:1 SP;
+  SP = (SP + 1) & 0xff;
 }
 :POPXL is op=0xf & word1=0xd & word2=0x6 {
-	# TODO read value from stack
-	SP = SP + 1;
+  $(XL) = *[ram]:1 SP;
+  SP = (SP + 1) & 0xff;
 }
 :POPYP is op=0xf & word1=0xd & word2=0x7 {
-	# TODO read value from stack
-	SP = SP + 1;
+  $(YP) = *[ram]:1 SP;
+  SP = (SP + 1) & 0xff;
 }
 :POPYH is op=0xf & word1=0xd & word2=0x8 {
-	# TODO read value from stack
-	SP = SP + 1;
+  $(YH) = *[ram]:1 SP;
+  SP = (SP + 1) & 0xff;
 }
 :POPYL is op=0xf & word1=0xd & word2=0x9 {
-	# TODO read value from stack
-	SP = SP + 1;
+  $(YL) = *[ram]:1 SP;
+  SP = (SP + 1) & 0xff;
 }
 :POPF is op=0xf & word1=0xd & word2=0xa {
-	# TODO read value from stack
-	SP = SP + 1;
+  local tmp = *[ram]:1 SP;
+  C = (tmp & 0x1);
+  Z = (tmp >> 1) & 0x1;
+  D = (tmp >> 2) & 0x1;
+  I = (tmp >> 3) & 0x1;
+  SP = (SP + 1) & 0xff;
 }
 
 # LD SPH, r
-:LD_SPH_A is op=0xf & word1=0xe & reg3=0x0 & reg4=0x0 {}
-:LD_SPH_B is op=0xf & word1=0xe & reg3=0x0 & reg4=0x1 {}
-:LD_SPH_MX is op=0xf & word1=0xe & reg3=0x0 & reg4=0x2 {}
-:LD_SPH_MY is op=0xf & word1=0xe & reg3=0x0 & reg4=0x3 {}
+:LD_SPH_A is op=0xf & word1=0xe & reg3=0x0 & reg4=0x0 {
+  $(SPH) = A;
+}
+:LD_SPH_B is op=0xf & word1=0xe & reg3=0x0 & reg4=0x1 {
+  $(SPH) = B;
+}
+:LD_SPH_MX is op=0xf & word1=0xe & reg3=0x0 & reg4=0x2 {
+  $(SPH) = $(MX);
+}
+:LD_SPH_MY is op=0xf & word1=0xe & reg3=0x0 & reg4=0x3 {
+  $(SPH) = $(MY);
+}
 
 # LD SPL, r
 #:SWSPL r2 is op=0xf & word1=0xf & reg3=0x0 & r2 {}
-:LD_SPL_A  is op=0xf & word1=0xf & reg3=0x0 & reg4=0x0 {}
-:LD_SPL_B  is op=0xf & word1=0xf & reg3=0x0 & reg4=0x1 {}
-:LD_SPL_MX  is op=0xf & word1=0xf & reg3=0x0 & reg4=0x2 {}
-:LD_SPL_MY  is op=0xf & word1=0xf & reg3=0x0 & reg4=0x3 {}
+:LD_SPL_A  is op=0xf & word1=0xf & reg3=0x0 & reg4=0x0 {
+  $(SPL) = A;
+}
+:LD_SPL_B  is op=0xf & word1=0xf & reg3=0x0 & reg4=0x1 {
+  $(SPL) = B;
+}
+:LD_SPL_MX  is op=0xf & word1=0xf & reg3=0x0 & reg4=0x2 {
+  $(SPL) = $(MX);
+}
+:LD_SPL_MY  is op=0xf & word1=0xf & reg3=0x0 & reg4=0x3 {
+  $(SPL) = $(MY);
+}
 
 #:LDSPH r2 is op=0xf & word1=0xe & reg3=0x1 & r2 {}
-:LD_A_SPH is op=0xf & word1=0xe & reg3=0x1 & reg4=0x0 {}
-:LD_B_SPH is op=0xf & word1=0xe & reg3=0x1 & reg4=0x1 {}
-:LD_MX_SPH is op=0xf & word1=0xe & reg3=0x1 & reg4=0x2 {}
-:LD_MY_SPH is op=0xf & word1=0xe & reg3=0x1 & reg4=0x3 {}
+:LD_A_SPH is op=0xf & word1=0xe & reg3=0x1 & reg4=0x0 {
+  A = $(SPH);
+}
+:LD_B_SPH is op=0xf & word1=0xe & reg3=0x1 & reg4=0x1 {
+  B = $(SPH);
+}
+:LD_MX_SPH is op=0xf & word1=0xe & reg3=0x1 & reg4=0x2 {
+  $(MX) = $(SPH);
+}
+:LD_MY_SPH is op=0xf & word1=0xe & reg3=0x1 & reg4=0x3 {
+  $(MY) = $(SPH);
+}
 
 #:LDSPL r2 is op=0xf & word1=0xf & reg3=0x1 & r2 {}
-:LD_A_SPL is op=0xf & word1=0xf & reg3=0x1 & reg4=0x0 {}
-:LD_B_SPL is op=0xf & word1=0xf & reg3=0x1 & reg4=0x1 {}
-:LD_MX_SPL is op=0xf & word1=0xf & reg3=0x1 & reg4=0x2 {}
-:LD_MY_SPL is op=0xf & word1=0xf & reg3=0x1 & reg4=0x3 {}
+:LD_A_SPL is op=0xf & word1=0xf & reg3=0x1 & reg4=0x0 {
+  A = $(SPL);
+}
+:LD_B_SPL is op=0xf & word1=0xf & reg3=0x1 & reg4=0x1 {
+  B = $(SPL);
+}
+:LD_MX_SPL is op=0xf & word1=0xf & reg3=0x1 & reg4=0x2 {
+  $(MX) = $(SPL);
+}
+:LD_MY_SPL is op=0xf & word1=0xf & reg3=0x1 & reg4=0x3 {
+  $(MY) = $(SPL);
+}
+
+macro doAdd(dst, op) {
+  local tmp = dst + op;
+  if (D && tmp >= 10) goto <decimal>;
+  dst = tmp & 0xf;
+  C = (tmp & 0x10) != 0;
+  goto <end>;
+  <decimal>
+  dst = (tmp - 10) & 0xf;
+  C = 1;
+  <end>
+  Z = (dst & 0xf) == 0;
+}
 
 # Arithmetic Instructions
 #:ADD r0,i is op=0xc & reg1=0x0 & r0 & i {}
-:ADD_A i is op=0xc & reg1=0x0 & reg2=0x0 & i {}
-:ADD_B i is op=0xc & reg1=0x0 & reg2=0x1 & i {}
-:ADD_MX i is op=0xc & reg1=0x0 & reg2=0x2 & i {}
-:ADD_MY i is op=0xc & reg1=0x0 & reg2=0x3 & i {}
+:ADD_A i is op=0xc & reg1=0x0 & reg2=0x0 & i {
+  doAdd(A, i);
+}
+:ADD_B i is op=0xc & reg1=0x0 & reg2=0x1 & i {
+  doAdd(B, i);
+}
+:ADD_MX i is op=0xc & reg1=0x0 & reg2=0x2 & i {
+  doAdd($(MX), i);
+}
+:ADD_MY i is op=0xc & reg1=0x0 & reg2=0x3 & i {
+  doAdd($(MY), i);
+}
 
 #:ADD r1,q is op=0xa & word1=0x8 & r1 & q {}
-:ADD_A_A is op=0xa & word1=0x8 & reg3=0x0 & reg4=0x0 {}
-:ADD_A_B is op=0xa & word1=0x8 & reg3=0x0 & reg4=0x1 {}
-:ADD_A_MX is op=0xa & word1=0x8 & reg3=0x0 & reg4=0x2 {}
-:ADD_A_MY is op=0xa & word1=0x8 & reg3=0x0 & reg4=0x3 {}
-:ADD_B_A is op=0xa & word1=0x8 & reg3=0x1 & reg4=0x0 {}
-:ADD_B_B is op=0xa & word1=0x8 & reg3=0x1 & reg4=0x1 {}
-:ADD_B_MX is op=0xa & word1=0x8 & reg3=0x1 & reg4=0x2 {}
-:ADD_B_MY is op=0xa & word1=0x8 & reg3=0x1 & reg4=0x3 {}
-:ADD_MX_A is op=0xa & word1=0x8 & reg3=0x2 & reg4=0x0 {}
-:ADD_MX_B is op=0xa & word1=0x8 & reg3=0x2 & reg4=0x1 {}
-:ADD_MX_MX is op=0xa & word1=0x8 & reg3=0x2 & reg4=0x2 {}
-:ADD_MX_MY is op=0xa & word1=0x8 & reg3=0x2 & reg4=0x3 {}
-:ADD_MY_A is op=0xa & word1=0x8 & reg3=0x3 & reg4=0x0 {}
-:ADD_MY_B is op=0xa & word1=0x8 & reg3=0x3 & reg4=0x1 {}
-:ADD_MY_MX is op=0xa & word1=0x8 & reg3=0x3 & reg4=0x2 {}
-:ADD_MY_MY is op=0xa & word1=0x8 & reg3=0x3 & reg4=0x3 {}
+:ADD_A_A is op=0xa & word1=0x8 & reg3=0x0 & reg4=0x0 {
+  doAdd(A, A);
+}
+:ADD_A_B is op=0xa & word1=0x8 & reg3=0x0 & reg4=0x1 {
+  doAdd(A, B);
+}
+:ADD_A_MX is op=0xa & word1=0x8 & reg3=0x0 & reg4=0x2 {
+  doAdd(A, $(MX));
+}
+:ADD_A_MY is op=0xa & word1=0x8 & reg3=0x0 & reg4=0x3 {
+  doAdd(A, $(MY));
+}
+:ADD_B_A is op=0xa & word1=0x8 & reg3=0x1 & reg4=0x0 {
+  doAdd(B, A);
+}
+:ADD_B_B is op=0xa & word1=0x8 & reg3=0x1 & reg4=0x1 {
+  doAdd(B, B);
+}
+:ADD_B_MX is op=0xa & word1=0x8 & reg3=0x1 & reg4=0x2 {
+  doAdd(B, $(MX));
+}
+:ADD_B_MY is op=0xa & word1=0x8 & reg3=0x1 & reg4=0x3 {
+  doAdd(B, $(MY));
+}
+:ADD_MX_A is op=0xa & word1=0x8 & reg3=0x2 & reg4=0x0 {
+  doAdd($(MX), A);
+}
+:ADD_MX_B is op=0xa & word1=0x8 & reg3=0x2 & reg4=0x1 {
+  doAdd($(MX), B);
+}
+:ADD_MX_MX is op=0xa & word1=0x8 & reg3=0x2 & reg4=0x2 {
+  doAdd($(MX), $(MX));
+}
+:ADD_MX_MY is op=0xa & word1=0x8 & reg3=0x2 & reg4=0x3 {
+  doAdd($(MX), $(MY));
+}
+:ADD_MY_A is op=0xa & word1=0x8 & reg3=0x3 & reg4=0x0 {
+  doAdd($(MY), A);
+}
+:ADD_MY_B is op=0xa & word1=0x8 & reg3=0x3 & reg4=0x1 {
+  doAdd($(MY), B);
+}
+:ADD_MY_MX is op=0xa & word1=0x8 & reg3=0x3 & reg4=0x2 {
+  doAdd($(MY), $(MX));
+}
+:ADD_MY_MY is op=0xa & word1=0x8 & reg3=0x3 & reg4=0x3 {
+  doAdd($(MY), $(MY));
+}
+
+macro doAddWithCarry(dst, op) {
+  doAdd(dst, op + C);
+}
 
 #:ADC r0,i is op=0xc & reg1=0x1 & r0 & i {}
-:ADC_A i is op=0xc & reg1=0x1 & reg2=0x0 & i {}
-:ADC_B i is op=0xc & reg1=0x1 & reg2=0x1 & i {}
-:ADC_MX i is op=0xc & reg1=0x1 & reg2=0x2 & i {}
-:ADC_MY i is op=0xc & reg1=0x1 & reg2=0x3 & i {}
+:ADC_A i is op=0xc & reg1=0x1 & reg2=0x0 & i {
+  doAddWithCarry(A, i);
+}
+:ADC_B i is op=0xc & reg1=0x1 & reg2=0x1 & i {
+  doAddWithCarry(B, i);
+}
+:ADC_MX i is op=0xc & reg1=0x1 & reg2=0x2 & i {
+  doAddWithCarry($(MX), i);
+}
+:ADC_MY i is op=0xc & reg1=0x1 & reg2=0x3 & i {
+  doAddWithCarry($(MY), i);
+}
 
 #:ADC r1,q is op=0xa & word1=0x9 & r1 & q {}
-:ADC_A_A is op=0xa & word1=0x9 & reg3=0x0 & reg4=0x0 {}
-:ADC_A_B is op=0xa & word1=0x9 & reg3=0x0 & reg4=0x1 {}
-:ADC_A_MX is op=0xa & word1=0x9 & reg3=0x0 & reg4=0x2 {}
-:ADC_A_MY is op=0xa & word1=0x9 & reg3=0x0 & reg4=0x3 {}
-:ADC_B_A is op=0xa & word1=0x9 & reg3=0x1 & reg4=0x0 {}
-:ADC_B_B is op=0xa & word1=0x9 & reg3=0x1 & reg4=0x1 {}
-:ADC_B_MX is op=0xa & word1=0x9 & reg3=0x1 & reg4=0x2 {}
-:ADC_B_MY is op=0xa & word1=0x9 & reg3=0x1 & reg4=0x3 {}
-:ADC_MX_A is op=0xa & word1=0x9 & reg3=0x2 & reg4=0x0 {}
-:ADC_MX_B is op=0xa & word1=0x9 & reg3=0x2 & reg4=0x1 {}
-:ADC_MX_MX is op=0xa & word1=0x9 & reg3=0x2 & reg4=0x2 {}
-:ADC_MX_MY is op=0xa & word1=0x9 & reg3=0x2 & reg4=0x3 {}
-:ADC_MY_A is op=0xa & word1=0x9 & reg3=0x3 & reg4=0x0 {}
-:ADC_MY_B is op=0xa & word1=0x9 & reg3=0x3 & reg4=0x1 {}
-:ADC_MY_MX is op=0xa & word1=0x9 & reg3=0x3 & reg4=0x2 {}
-:ADC_MY_MY is op=0xa & word1=0x9 & reg3=0x3 & reg4=0x3 {}
+:ADC_A_A is op=0xa & word1=0x9 & reg3=0x0 & reg4=0x0 {
+  doAddWithCarry(A, A);
+}
+:ADC_A_B is op=0xa & word1=0x9 & reg3=0x0 & reg4=0x1 {
+  doAddWithCarry(A, B);
+}
+:ADC_A_MX is op=0xa & word1=0x9 & reg3=0x0 & reg4=0x2 {
+  doAddWithCarry(A, $(MX));
+}
+:ADC_A_MY is op=0xa & word1=0x9 & reg3=0x0 & reg4=0x3 {
+  doAddWithCarry(A, $(MY));
+}
+:ADC_B_A is op=0xa & word1=0x9 & reg3=0x1 & reg4=0x0 {
+  doAddWithCarry(B, A);
+}
+:ADC_B_B is op=0xa & word1=0x9 & reg3=0x1 & reg4=0x1 {
+  doAddWithCarry(B, B);
+}
+:ADC_B_MX is op=0xa & word1=0x9 & reg3=0x1 & reg4=0x2 {
+  doAddWithCarry(B, $(MX));
+}
+:ADC_B_MY is op=0xa & word1=0x9 & reg3=0x1 & reg4=0x3 {
+  doAddWithCarry(B, $(MY));
+}
+:ADC_MX_A is op=0xa & word1=0x9 & reg3=0x2 & reg4=0x0 {
+  doAddWithCarry($(MX), A);
+}
+:ADC_MX_B is op=0xa & word1=0x9 & reg3=0x2 & reg4=0x1 {
+  doAddWithCarry($(MX), B);
+}
+:ADC_MX_MX is op=0xa & word1=0x9 & reg3=0x2 & reg4=0x2 {
+  doAddWithCarry($(MX), $(MX));
+}
+:ADC_MX_MY is op=0xa & word1=0x9 & reg3=0x2 & reg4=0x3 {
+  doAddWithCarry($(MX), $(MY));
+}
+:ADC_MY_A is op=0xa & word1=0x9 & reg3=0x3 & reg4=0x0 {
+  doAddWithCarry($(MY), A);
+}
+:ADC_MY_B is op=0xa & word1=0x9 & reg3=0x3 & reg4=0x1 {
+  doAddWithCarry($(MY), B);
+}
+:ADC_MY_MX is op=0xa & word1=0x9 & reg3=0x3 & reg4=0x2 {
+  doAddWithCarry($(MY), $(MX));
+}
+:ADC_MY_MY is op=0xa & word1=0x9 & reg3=0x3 & reg4=0x3 {
+  doAddWithCarry($(MY), $(MY));
+}
+
+macro doSubtract(dst, op) {
+  local tmp = dst - op;
+  # In decimal mode, the result is only different for
+  # negative numbers.
+  if (D && tmp & 0x10) goto <decimal>;
+  dst = tmp & 0xf;
+  goto <end>;
+  <decimal>
+  dst = (tmp - 6) & 0xf;
+  <end>
+  C = (tmp & 0x10) != 0;
+  Z = (dst & 0xf) == 0;
+}
 
 #:SUB r1,q is op=0xa & word1=0xa & r1 & q {}
-:SUB_A_A is op=0xa & word1=0xa & reg3=0x0 & reg4=0x0 {}
-:SUB_A_B is op=0xa & word1=0xa & reg3=0x0 & reg4=0x1 {}
-:SUB_A_MX is op=0xa & word1=0xa & reg3=0x0 & reg4=0x2 {}
-:SUB_A_MY is op=0xa & word1=0xa & reg3=0x0 & reg4=0x3 {}
-:SUB_B_A is op=0xa & word1=0xa & reg3=0x1 & reg4=0x0 {}
-:SUB_B_B is op=0xa & word1=0xa & reg3=0x1 & reg4=0x1 {}
-:SUB_B_MX is op=0xa & word1=0xa & reg3=0x1 & reg4=0x2 {}
-:SUB_B_MY is op=0xa & word1=0xa & reg3=0x1 & reg4=0x3 {}
-:SUB_MX_A is op=0xa & word1=0xa & reg3=0x2 & reg4=0x0 {}
-:SUB_MX_B is op=0xa & word1=0xa & reg3=0x2 & reg4=0x1 {}
-:SUB_MX_MX is op=0xa & word1=0xa & reg3=0x2 & reg4=0x2 {}
-:SUB_MX_MY is op=0xa & word1=0xa & reg3=0x2 & reg4=0x3 {}
-:SUB_MY_A is op=0xa & word1=0xa & reg3=0x3 & reg4=0x0 {}
-:SUB_MY_B is op=0xa & word1=0xa & reg3=0x3 & reg4=0x1 {}
-:SUB_MY_MX is op=0xa & word1=0xa & reg3=0x3 & reg4=0x2 {}
-:SUB_MY_MY is op=0xa & word1=0xa & reg3=0x3 & reg4=0x3 {}
+:SUB_A_A is op=0xa & word1=0xa & reg3=0x0 & reg4=0x0 {
+  doSubtract(A, A);
+}
+:SUB_A_B is op=0xa & word1=0xa & reg3=0x0 & reg4=0x1 {
+  doSubtract(A, B);
+}
+:SUB_A_MX is op=0xa & word1=0xa & reg3=0x0 & reg4=0x2 {
+  doSubtract(A, $(MX));
+}
+:SUB_A_MY is op=0xa & word1=0xa & reg3=0x0 & reg4=0x3 {
+  doSubtract(A, $(MY));
+}
+:SUB_B_A is op=0xa & word1=0xa & reg3=0x1 & reg4=0x0 {
+  doSubtract(B, A);
+}
+:SUB_B_B is op=0xa & word1=0xa & reg3=0x1 & reg4=0x1 {
+  doSubtract(B, B);
+}
+:SUB_B_MX is op=0xa & word1=0xa & reg3=0x1 & reg4=0x2 {
+  doSubtract(B, $(MX));
+}
+:SUB_B_MY is op=0xa & word1=0xa & reg3=0x1 & reg4=0x3 {
+  doSubtract(B, $(MY));
+}
+:SUB_MX_A is op=0xa & word1=0xa & reg3=0x2 & reg4=0x0 {
+  doSubtract($(MX), A);
+}
+:SUB_MX_B is op=0xa & word1=0xa & reg3=0x2 & reg4=0x1 {
+  doSubtract($(MX), B);
+}
+:SUB_MX_MX is op=0xa & word1=0xa & reg3=0x2 & reg4=0x2 {
+  doSubtract($(MX), $(MX));
+}
+:SUB_MX_MY is op=0xa & word1=0xa & reg3=0x2 & reg4=0x3 {
+  doSubtract($(MX), $(MY));
+}
+:SUB_MY_A is op=0xa & word1=0xa & reg3=0x3 & reg4=0x0 {
+  doSubtract($(MY), A);
+}
+:SUB_MY_B is op=0xa & word1=0xa & reg3=0x3 & reg4=0x1 {
+  doSubtract($(MY), B);
+}
+:SUB_MY_MX is op=0xa & word1=0xa & reg3=0x3 & reg4=0x2 {
+  doSubtract($(MY), $(MX));
+}
+:SUB_MY_MY is op=0xa & word1=0xa & reg3=0x3 & reg4=0x3 {
+  doSubtract($(MY), $(MY));
+}
+
+macro doSubWithCarry(dst, op) {
+  doSubtract(dst, op + C);
+}
 
 #:SBC r0,i is op=0xd & reg1=0x1 & r0 & i {}
-:SBC_A i is op=0xd & reg1=0x1 & reg2=0x0 & i {}
-:SBC_B i is op=0xd & reg1=0x1 & reg2=0x1 & i {}
-:SBC_MX i is op=0xd & reg1=0x1 & reg2=0x2 & i {}
-:SBC_MY i is op=0xd & reg1=0x1 & reg2=0x3 & i {}
+:SBC_A i is op=0xd & reg1=0x1 & reg2=0x0 & i {
+  doSubWithCarry(A, i);
+}
+:SBC_B i is op=0xd & reg1=0x1 & reg2=0x1 & i {
+  doSubWithCarry(B, i);
+}
+:SBC_MX i is op=0xd & reg1=0x1 & reg2=0x2 & i {
+  doSubWithCarry($(MX), i);
+}
+:SBC_MY i is op=0xd & reg1=0x1 & reg2=0x3 & i {
+  doSubWithCarry($(MY), i);
+}
 
 #:SBC r1,q is op=0xa & word1=0xb & r1 & q {}
-:SBC_A_A is op=0xa & word1=0xb & reg3=0x0 & reg4=0x0 {}
-:SBC_A_B is op=0xa & word1=0xb & reg3=0x0 & reg4=0x1 {}
-:SBC_A_MX is op=0xa & word1=0xb & reg3=0x0 & reg4=0x2 {}
-:SBC_A_MY is op=0xa & word1=0xb & reg3=0x0 & reg4=0x3 {}
-:SBC_B_A is op=0xa & word1=0xb & reg3=0x1 & reg4=0x0 {}
-:SBC_B_B is op=0xa & word1=0xb & reg3=0x1 & reg4=0x1 {}
-:SBC_B_MX is op=0xa & word1=0xb & reg3=0x1 & reg4=0x2 {}
-:SBC_B_MY is op=0xa & word1=0xb & reg3=0x1 & reg4=0x3 {}
-:SBC_MX_A is op=0xa & word1=0xb & reg3=0x2 & reg4=0x0 {}
-:SBC_MX_B is op=0xa & word1=0xb & reg3=0x2 & reg4=0x1 {}
-:SBC_MX_MX is op=0xa & word1=0xb & reg3=0x2 & reg4=0x2 {}
-:SBC_MX_MY is op=0xa & word1=0xb & reg3=0x2 & reg4=0x3 {}
-:SBC_MY_A is op=0xa & word1=0xb & reg3=0x3 & reg4=0x0 {}
-:SBC_MY_B is op=0xa & word1=0xb & reg3=0x3 & reg4=0x1 {}
-:SBC_MY_MX is op=0xa & word1=0xb & reg3=0x3 & reg4=0x2 {}
-:SBC_MY_MY is op=0xa & word1=0xb & reg3=0x3 & reg4=0x3 {}
+:SBC_A_A is op=0xa & word1=0xb & reg3=0x0 & reg4=0x0 {
+  doSubWithCarry(A, A);
+}
+:SBC_A_B is op=0xa & word1=0xb & reg3=0x0 & reg4=0x1 {
+  doSubWithCarry(A, B);
+}
+:SBC_A_MX is op=0xa & word1=0xb & reg3=0x0 & reg4=0x2 {
+  doSubWithCarry(A, $(MX));
+}
+:SBC_A_MY is op=0xa & word1=0xb & reg3=0x0 & reg4=0x3 {
+  doSubWithCarry(A, $(MY));
+}
+:SBC_B_A is op=0xa & word1=0xb & reg3=0x1 & reg4=0x0 {
+  doSubWithCarry(B, A);
+}
+:SBC_B_B is op=0xa & word1=0xb & reg3=0x1 & reg4=0x1 {
+  doSubWithCarry(B, B);
+}
+:SBC_B_MX is op=0xa & word1=0xb & reg3=0x1 & reg4=0x2 {
+  doSubWithCarry(B, $(MX));
+}
+:SBC_B_MY is op=0xa & word1=0xb & reg3=0x1 & reg4=0x3 {
+  doSubWithCarry(B, $(MY));
+}
+:SBC_MX_A is op=0xa & word1=0xb & reg3=0x2 & reg4=0x0 {
+  doSubWithCarry($(MX), A);
+}
+:SBC_MX_B is op=0xa & word1=0xb & reg3=0x2 & reg4=0x1 {
+  doSubWithCarry($(MX), B);
+}
+:SBC_MX_MX is op=0xa & word1=0xb & reg3=0x2 & reg4=0x2 {
+  doSubWithCarry($(MX), $(MX));
+}
+:SBC_MX_MY is op=0xa & word1=0xb & reg3=0x2 & reg4=0x3 {
+  doSubWithCarry($(MX), $(MY));
+}
+:SBC_MY_A is op=0xa & word1=0xb & reg3=0x3 & reg4=0x0 {
+  doSubWithCarry($(MY), A);
+}
+:SBC_MY_B is op=0xa & word1=0xb & reg3=0x3 & reg4=0x1 {
+  doSubWithCarry($(MY), B);
+}
+:SBC_MY_MX is op=0xa & word1=0xb & reg3=0x3 & reg4=0x2 {
+  doSubWithCarry($(MY), $(MX));
+}
+:SBC_MY_MY is op=0xa & word1=0xb & reg3=0x3 & reg4=0x3 {
+  doSubWithCarry($(MY), $(MY));
+}
+
+macro doAnd(dst, op) {
+  dst = (dst & op) & 0xf;
+  Z = (dst == 0);
+}
 
 #:AND r0,i is op=0xc & reg1=0x2 & r0 & i {}
-:AND_A i is op=0xc & reg1=0x2 & reg2=0x0 & i {}
-:AND_B i is op=0xc & reg1=0x2 & reg2=0x1 & i {}
-:AND_MX i is op=0xc & reg1=0x2 & reg2=0x2 & i {}
-:AND_MY i is op=0xc & reg1=0x2 & reg2=0x3 & i {}
+:AND_A i is op=0xc & reg1=0x2 & reg2=0x0 & i {
+  doAnd(A, i);
+}
+:AND_B i is op=0xc & reg1=0x2 & reg2=0x1 & i {
+  doAnd(B, i);
+}
+:AND_MX i is op=0xc & reg1=0x2 & reg2=0x2 & i {
+  doAnd($(MX), i);
+}
+:AND_MY i is op=0xc & reg1=0x2 & reg2=0x3 & i {
+  doAnd($(MY), i);
+}
 
 #:AND r1,q is op=0xa & word1=0xc & r1 & q {}
-:AND_A_A is op=0xa & word1=0xc & reg3=0x0 & reg4=0x0 {}
-:AND_A_B is op=0xa & word1=0xc & reg3=0x0 & reg4=0x1 {}
-:AND_A_MX is op=0xa & word1=0xc & reg3=0x0 & reg4=0x2 {}
-:AND_A_MY is op=0xa & word1=0xc & reg3=0x0 & reg4=0x3 {}
-:AND_B_A is op=0xa & word1=0xc & reg3=0x1 & reg4=0x0 {}
-:AND_B_B is op=0xa & word1=0xc & reg3=0x1 & reg4=0x1 {}
-:AND_B_MX is op=0xa & word1=0xc & reg3=0x1 & reg4=0x2 {}
-:AND_B_MY is op=0xa & word1=0xc & reg3=0x1 & reg4=0x3 {}
-:AND_MX_A is op=0xa & word1=0xc & reg3=0x2 & reg4=0x0 {}
-:AND_MX_B is op=0xa & word1=0xc & reg3=0x2 & reg4=0x1 {}
-:AND_MX_MX is op=0xa & word1=0xc & reg3=0x2 & reg4=0x2 {}
-:AND_MX_MY is op=0xa & word1=0xc & reg3=0x2 & reg4=0x3 {}
-:AND_MY_A is op=0xa & word1=0xc & reg3=0x3 & reg4=0x0 {}
-:AND_MY_B is op=0xa & word1=0xc & reg3=0x3 & reg4=0x1 {}
-:AND_MY_MX is op=0xa & word1=0xc & reg3=0x3 & reg4=0x2 {}
-:AND_MY_MY is op=0xa & word1=0xc & reg3=0x3 & reg4=0x3 {}
+:AND_A_A is op=0xa & word1=0xc & reg3=0x0 & reg4=0x0 {
+  doAnd(A, A);
+}
+:AND_A_B is op=0xa & word1=0xc & reg3=0x0 & reg4=0x1 {
+  doAnd(A, B);
+}
+:AND_A_MX is op=0xa & word1=0xc & reg3=0x0 & reg4=0x2 {
+  doAnd(A, $(MX));
+}
+:AND_A_MY is op=0xa & word1=0xc & reg3=0x0 & reg4=0x3 {
+  doAnd(A, $(MY));
+}
+:AND_B_A is op=0xa & word1=0xc & reg3=0x1 & reg4=0x0 {
+  doAnd(B, A);
+}
+:AND_B_B is op=0xa & word1=0xc & reg3=0x1 & reg4=0x1 {
+  doAnd(B, B);
+}
+:AND_B_MX is op=0xa & word1=0xc & reg3=0x1 & reg4=0x2 {
+  doAnd(B, $(MX));
+}
+:AND_B_MY is op=0xa & word1=0xc & reg3=0x1 & reg4=0x3 {
+  doAnd(B, $(MY));
+}
+:AND_MX_A is op=0xa & word1=0xc & reg3=0x2 & reg4=0x0 {
+  doAnd($(MX), A);
+}
+:AND_MX_B is op=0xa & word1=0xc & reg3=0x2 & reg4=0x1 {
+  doAnd($(MX), B);
+}
+:AND_MX_MX is op=0xa & word1=0xc & reg3=0x2 & reg4=0x2 {
+  doAnd($(MX), $(MX));
+}
+:AND_MX_MY is op=0xa & word1=0xc & reg3=0x2 & reg4=0x3 {
+  doAnd($(MX), $(MY));
+}
+:AND_MY_A is op=0xa & word1=0xc & reg3=0x3 & reg4=0x0 {
+  doAnd($(MY), A);
+}
+:AND_MY_B is op=0xa & word1=0xc & reg3=0x3 & reg4=0x1 {
+  doAnd($(MY), B);
+}
+:AND_MY_MX is op=0xa & word1=0xc & reg3=0x3 & reg4=0x2 {
+  doAnd($(MY), $(MX));
+}
+:AND_MY_MY is op=0xa & word1=0xc & reg3=0x3 & reg4=0x3 {
+  doAnd($(MY), $(MY));
+}
 
+macro doOr(dst, op) {
+  dst = (dst | op) & 0xf;
+  Z = (dst == 0);
+}
 
 #:OR r0,i is op=0xc & reg1=0x3 & r0 & i {}
-:OR_A i is op=0xc & reg1=0x3 & reg2=0x0 & i {}
-:OR_B i is op=0xc & reg1=0x3 & reg2=0x1 & i {}
-:OR_MX i is op=0xc & reg1=0x3 & reg2=0x2 & i {}
-:OR_MY i is op=0xc & reg1=0x3 & reg2=0x3 & i {}
+:OR_A i is op=0xc & reg1=0x3 & reg2=0x0 & i {
+  doOr(A, i);
+}
+:OR_B i is op=0xc & reg1=0x3 & reg2=0x1 & i {
+  doOr(B, i);
+}
+:OR_MX i is op=0xc & reg1=0x3 & reg2=0x2 & i {
+  doOr($(MX), i);
+}
+:OR_MY i is op=0xc & reg1=0x3 & reg2=0x3 & i {
+  doOr($(MY), i);
+}
 
 #:OR r1,q is op=0xa & word1=0xd & r1 & q {}
-:OR_A_A is op=0xa & word1=0xd & reg3=0x0 & reg4=0x0 {}
-:OR_A_B is op=0xa & word1=0xd & reg3=0x0 & reg4=0x1 {}
-:OR_A_MX is op=0xa & word1=0xd & reg3=0x0 & reg4=0x2 {}
-:OR_A_MY is op=0xa & word1=0xd & reg3=0x0 & reg4=0x3 {}
-:OR_B_A is op=0xa & word1=0xd & reg3=0x1 & reg4=0x0 {}
-:OR_B_B is op=0xa & word1=0xd & reg3=0x1 & reg4=0x1 {}
-:OR_B_MX is op=0xa & word1=0xd & reg3=0x1 & reg4=0x2 {}
-:OR_B_MY is op=0xa & word1=0xd & reg3=0x1 & reg4=0x3 {}
-:OR_MX_A is op=0xa & word1=0xd & reg3=0x2 & reg4=0x0 {}
-:OR_MX_B is op=0xa & word1=0xd & reg3=0x2 & reg4=0x1 {}
-:OR_MX_MX is op=0xa & word1=0xd & reg3=0x2 & reg4=0x2 {}
-:OR_MX_MY is op=0xa & word1=0xd & reg3=0x2 & reg4=0x3 {}
-:OR_MY_A is op=0xa & word1=0xd & reg3=0x3 & reg4=0x0 {}
-:OR_MY_B is op=0xa & word1=0xd & reg3=0x3 & reg4=0x1 {}
-:OR_MY_MX is op=0xa & word1=0xd & reg3=0x3 & reg4=0x2 {}
-:OR_MY_MY is op=0xa & word1=0xd & reg3=0x3 & reg4=0x3 {}
+:OR_A_A is op=0xa & word1=0xd & reg3=0x0 & reg4=0x0 {
+  doOr(A, A);
+}
+:OR_A_B is op=0xa & word1=0xd & reg3=0x0 & reg4=0x1 {
+  doOr(A, B);
+}
+:OR_A_MX is op=0xa & word1=0xd & reg3=0x0 & reg4=0x2 {
+  doOr(A, $(MX));
+}
+:OR_A_MY is op=0xa & word1=0xd & reg3=0x0 & reg4=0x3 {
+  doOr(A, $(MY));
+}
+:OR_B_A is op=0xa & word1=0xd & reg3=0x1 & reg4=0x0 {
+  doOr(B, A);
+}
+:OR_B_B is op=0xa & word1=0xd & reg3=0x1 & reg4=0x1 {
+  doOr(B, B);
+}
+:OR_B_MX is op=0xa & word1=0xd & reg3=0x1 & reg4=0x2 {
+  doOr(B, $(MX));
+}
+:OR_B_MY is op=0xa & word1=0xd & reg3=0x1 & reg4=0x3 {
+  doOr(B, $(MY));
+}
+:OR_MX_A is op=0xa & word1=0xd & reg3=0x2 & reg4=0x0 {
+  doOr($(MX), A);
+}
+:OR_MX_B is op=0xa & word1=0xd & reg3=0x2 & reg4=0x1 {
+  doOr($(MX), B);
+}
+:OR_MX_MX is op=0xa & word1=0xd & reg3=0x2 & reg4=0x2 {
+  doOr($(MX), $(MX));
+}
+:OR_MX_MY is op=0xa & word1=0xd & reg3=0x2 & reg4=0x3 {
+  doOr($(MX), $(MY));
+}
+:OR_MY_A is op=0xa & word1=0xd & reg3=0x3 & reg4=0x0 {
+  doOr($(MY), A);
+}
+:OR_MY_B is op=0xa & word1=0xd & reg3=0x3 & reg4=0x1 {
+  doOr($(MY), B);
+}
+:OR_MY_MX is op=0xa & word1=0xd & reg3=0x3 & reg4=0x2 {
+  doOr($(MY), $(MX));
+}
+:OR_MY_MY is op=0xa & word1=0xd & reg3=0x3 & reg4=0x3 {
+  doOr($(MY), $(MY));
+}
+
+macro doXor(dst, op) {
+  dst = (dst ^ op);
+  Z = (dst == 0);
+}
 
 #:XOR r0,i is op=0xd & reg1=0x0 & r0 & i {}
-:XOR_A i is op=0xd & reg1=0x0 & reg2=0x0 & i {}
-:XOR_B i is op=0xd & reg1=0x0 & reg2=0x1 & i {}
-:XOR_MX i is op=0xd & reg1=0x0 & reg2=0x2 & i {}
-:XOR_MY i is op=0xd & reg1=0x0 & reg2=0x3 & i {}
+:XOR_A i is op=0xd & reg1=0x0 & reg2=0x0 & i {
+  doXor(A, i);
+}
+:XOR_B i is op=0xd & reg1=0x0 & reg2=0x1 & i {
+  doXor(B, i);
+}
+:XOR_MX i is op=0xd & reg1=0x0 & reg2=0x2 & i {
+  doXor($(MX), i);
+}
+:XOR_MY i is op=0xd & reg1=0x0 & reg2=0x3 & i {
+  doXor($(MY), i);
+}
 
 #:XOR r1,q is op=0xa & word1=0xe & r1 & q {}
-:XOR_A_A is op=0xa & word1=0xe & reg3=0x0 & reg4=0x0 {}
-:XOR_A_B is op=0xa & word1=0xe & reg3=0x0 & reg4=0x1 {}
-:XOR_A_MX is op=0xa & word1=0xe & reg3=0x0 & reg4=0x2 {}
-:XOR_A_MY is op=0xa & word1=0xe & reg3=0x0 & reg4=0x3 {}
-:XOR_B_A is op=0xa & word1=0xe & reg3=0x1 & reg4=0x0 {}
-:XOR_B_B is op=0xa & word1=0xe & reg3=0x1 & reg4=0x1 {}
-:XOR_B_MX is op=0xa & word1=0xe & reg3=0x1 & reg4=0x2 {}
-:XOR_B_MY is op=0xa & word1=0xe & reg3=0x1 & reg4=0x3 {}
-:XOR_MX_A is op=0xa & word1=0xe & reg3=0x2 & reg4=0x0 {}
-:XOR_MX_B is op=0xa & word1=0xe & reg3=0x2 & reg4=0x1 {}
-:XOR_MX_MX is op=0xa & word1=0xe & reg3=0x2 & reg4=0x2 {}
-:XOR_MX_MY is op=0xa & word1=0xe & reg3=0x2 & reg4=0x3 {}
-:XOR_MY_A is op=0xa & word1=0xe & reg3=0x3 & reg4=0x0 {}
-:XOR_MY_B is op=0xa & word1=0xe & reg3=0x3 & reg4=0x1 {}
-:XOR_MY_MX is op=0xa & word1=0xe & reg3=0x3 & reg4=0x2 {}
-:XOR_MY_MY is op=0xa & word1=0xe & reg3=0x3 & reg4=0x3 {}
+:XOR_A_A is op=0xa & word1=0xe & reg3=0x0 & reg4=0x0 {
+  doXor(A, A);
+}
+:XOR_A_B is op=0xa & word1=0xe & reg3=0x0 & reg4=0x1 {
+  doXor(A, B);
+}
+:XOR_A_MX is op=0xa & word1=0xe & reg3=0x0 & reg4=0x2 {
+  doXor(A, $(MX));
+}
+:XOR_A_MY is op=0xa & word1=0xe & reg3=0x0 & reg4=0x3 {
+  doXor(A, $(MY));
+}
+:XOR_B_A is op=0xa & word1=0xe & reg3=0x1 & reg4=0x0 {
+  doXor(B, A);
+}
+:XOR_B_B is op=0xa & word1=0xe & reg3=0x1 & reg4=0x1 {
+  doXor(B, B);
+}
+:XOR_B_MX is op=0xa & word1=0xe & reg3=0x1 & reg4=0x2 {
+  doXor(B, $(MX));
+}
+:XOR_B_MY is op=0xa & word1=0xe & reg3=0x1 & reg4=0x3 {
+  doXor(B, $(MY));
+}
+:XOR_MX_A is op=0xa & word1=0xe & reg3=0x2 & reg4=0x0 {
+  doXor($(MX), A);
+}
+:XOR_MX_B is op=0xa & word1=0xe & reg3=0x2 & reg4=0x1 {
+  doXor($(MX), B);
+}
+:XOR_MX_MX is op=0xa & word1=0xe & reg3=0x2 & reg4=0x2 {
+  doXor($(MX), $(MX));
+}
+:XOR_MX_MY is op=0xa & word1=0xe & reg3=0x2 & reg4=0x3 {
+  doXor($(MX), $(MY));
+}
+:XOR_MY_A is op=0xa & word1=0xe & reg3=0x3 & reg4=0x0 {
+  doXor($(MY), A);
+}
+:XOR_MY_B is op=0xa & word1=0xe & reg3=0x3 & reg4=0x1 {
+  doXor($(MY), B);
+}
+:XOR_MY_MX is op=0xa & word1=0xe & reg3=0x3 & reg4=0x2 {
+  doXor($(MY), $(MX));
+}
+:XOR_MY_MY is op=0xa & word1=0xe & reg3=0x3 & reg4=0x3 {
+  doXor($(MY), $(MY));
+}
+
+macro doCmp(op1, op2) {
+  C = (op1 < op2);
+  Z = (op1 == op2);
+}
 
 #:CP r0,i is op=0xd & reg1=0x3 & r0 & i {}
-:CP_A i is op=0xd & reg1=0x3 & reg2=0x0 & i {}
-:CP_B i is op=0xd & reg1=0x3 & reg2=0x1 & i {}
-:CP_MX i is op=0xd & reg1=0x3 & reg2=0x2 & i {}
-:CP_MY i is op=0xd & reg1=0x3 & reg2=0x3 & i {}
+:CP_A i is op=0xd & reg1=0x3 & reg2=0x0 & i {
+  doCmp(A, i);
+}
+:CP_B i is op=0xd & reg1=0x3 & reg2=0x1 & i {
+  doCmp(B, i);
+}
+:CP_MX i is op=0xd & reg1=0x3 & reg2=0x2 & i {
+  doCmp($(MX), i);
+}
+:CP_MY i is op=0xd & reg1=0x3 & reg2=0x3 & i {
+  doCmp($(MY), i);
+}
 
 #:CP r1,q is op=0xf & word1=0x0 & r1 & q {}
-:CP_A_A is op=0xf & word1=0x0 & reg3=0x0 & reg4=0x0 {}
-:CP_A_B is op=0xf & word1=0x0 & reg3=0x0 & reg4=0x1 {}
-:CP_A_MX is op=0xf & word1=0x0 & reg3=0x0 & reg4=0x2 {}
-:CP_A_MY is op=0xf & word1=0x0 & reg3=0x0 & reg4=0x3 {}
-:CP_B_A is op=0xf & word1=0x0 & reg3=0x1 & reg4=0x0 {}
-:CP_B_B is op=0xf & word1=0x0 & reg3=0x1 & reg4=0x1 {}
-:CP_B_MX is op=0xf & word1=0x0 & reg3=0x1 & reg4=0x2 {}
-:CP_B_MY is op=0xf & word1=0x0 & reg3=0x1 & reg4=0x3 {}
-:CP_MX_A is op=0xf & word1=0x0 & reg3=0x2 & reg4=0x0 {}
-:CP_MX_B is op=0xf & word1=0x0 & reg3=0x2 & reg4=0x1 {}
-:CP_MX_MX is op=0xf & word1=0x0 & reg3=0x2 & reg4=0x2 {}
-:CP_MX_MY is op=0xf & word1=0x0 & reg3=0x2 & reg4=0x3 {}
-:CP_MY_A is op=0xf & word1=0x0 & reg3=0x3 & reg4=0x0 {}
-:CP_MY_B is op=0xf & word1=0x0 & reg3=0x3 & reg4=0x1 {}
-:CP_MY_MX is op=0xf & word1=0x0 & reg3=0x3 & reg4=0x2 {}
-:CP_MY_MY is op=0xf & word1=0x0 & reg3=0x3 & reg4=0x3 {}
+:CP_A_A is op=0xf & word1=0x0 & reg3=0x0 & reg4=0x0 {
+  doCmp(A, A);
+}
+:CP_A_B is op=0xf & word1=0x0 & reg3=0x0 & reg4=0x1 {
+  doCmp(A, B);
+}
+:CP_A_MX is op=0xf & word1=0x0 & reg3=0x0 & reg4=0x2 {
+  doCmp(A, $(MX));
+}
+:CP_A_MY is op=0xf & word1=0x0 & reg3=0x0 & reg4=0x3 {
+  doCmp(A, $(MY));
+}
+:CP_B_A is op=0xf & word1=0x0 & reg3=0x1 & reg4=0x0 {
+  doCmp(B, A);
+}
+:CP_B_B is op=0xf & word1=0x0 & reg3=0x1 & reg4=0x1 {
+  doCmp(B, B);
+}
+:CP_B_MX is op=0xf & word1=0x0 & reg3=0x1 & reg4=0x2 {
+  doCmp(B, $(MX));
+}
+:CP_B_MY is op=0xf & word1=0x0 & reg3=0x1 & reg4=0x3 {
+  doCmp(B, $(MY));
+}
+:CP_MX_A is op=0xf & word1=0x0 & reg3=0x2 & reg4=0x0 {
+  doCmp($(MX), A);
+}
+:CP_MX_B is op=0xf & word1=0x0 & reg3=0x2 & reg4=0x1 {
+  doCmp($(MX), B);
+}
+:CP_MX_MX is op=0xf & word1=0x0 & reg3=0x2 & reg4=0x2 {
+  doCmp($(MX), $(MX));
+}
+:CP_MX_MY is op=0xf & word1=0x0 & reg3=0x2 & reg4=0x3 {
+  doCmp($(MX), $(MY));
+}
+:CP_MY_A is op=0xf & word1=0x0 & reg3=0x3 & reg4=0x0 {
+  doCmp($(MY), A);
+}
+:CP_MY_B is op=0xf & word1=0x0 & reg3=0x3 & reg4=0x1 {
+  doCmp($(MY), B);
+}
+:CP_MY_MX is op=0xf & word1=0x0 & reg3=0x3 & reg4=0x2 {
+  doCmp($(MY), $(MX));
+}
+:CP_MY_MY is op=0xf & word1=0x0 & reg3=0x3 & reg4=0x3 {
+  doCmp($(MY), $(MY));
+}
+
+macro doFan(op1, op2) {
+  local tmp = (op1 & op2);
+  Z = (tmp == 0);
+}
 
 #:FAN r0,i is op=0xd & reg1=0x2 & r0 & i {}
-:FAN_A i is op=0xd & reg1=0x2 & reg2=0x0 & i {}
-:FAN_B i is op=0xd & reg1=0x2 & reg2=0x1 & i {}
-:FAN_MX i is op=0xd & reg1=0x2 & reg2=0x2 & i {}
-:FAN_MY i is op=0xd & reg1=0x2 & reg2=0x3 & i {}
+:FAN_A i is op=0xd & reg1=0x2 & reg2=0x0 & i {
+  doFan(A, i);
+}
+:FAN_B i is op=0xd & reg1=0x2 & reg2=0x1 & i {
+  doFan(B, i);
+}
+:FAN_MX i is op=0xd & reg1=0x2 & reg2=0x2 & i {
+  doFan($(MX), i);
+}
+:FAN_MY i is op=0xd & reg1=0x2 & reg2=0x3 & i {
+  doFan($(MY), i);
+}
 
 #:FAN r1,q is op=0xf & word1=0x1 & r1 & q {}
-:FAN_A_A is op=0xf & word1=0x1 & reg3=0x0 & reg4=0x0 {}
-:FAN_A_B is op=0xf & word1=0x1 & reg3=0x0 & reg4=0x1 {}
-:FAN_A_MX is op=0xf & word1=0x1 & reg3=0x0 & reg4=0x2 {}
-:FAN_A_MY is op=0xf & word1=0x1 & reg3=0x0 & reg4=0x3 {}
-:FAN_B_A is op=0xf & word1=0x1 & reg3=0x1 & reg4=0x0 {}
-:FAN_B_B is op=0xf & word1=0x1 & reg3=0x1 & reg4=0x1 {}
-:FAN_B_MX is op=0xf & word1=0x1 & reg3=0x1 & reg4=0x2 {}
-:FAN_B_MY is op=0xf & word1=0x1 & reg3=0x1 & reg4=0x3 {}
-:FAN_MX_A is op=0xf & word1=0x1 & reg3=0x2 & reg4=0x0 {}
-:FAN_MX_B is op=0xf & word1=0x1 & reg3=0x2 & reg4=0x1 {}
-:FAN_MX_MX is op=0xf & word1=0x1 & reg3=0x2 & reg4=0x2 {}
-:FAN_MX_MY is op=0xf & word1=0x1 & reg3=0x2 & reg4=0x3 {}
-:FAN_MY_A is op=0xf & word1=0x1 & reg3=0x3 & reg4=0x0 {}
-:FAN_MY_B is op=0xf & word1=0x1 & reg3=0x3 & reg4=0x1 {}
-:FAN_MY_MX is op=0xf & word1=0x1 & reg3=0x3 & reg4=0x2 {}
-:FAN_MY_MY is op=0xf & word1=0x1 & reg3=0x3 & reg4=0x3 {}
+:FAN_A_A is op=0xf & word1=0x1 & reg3=0x0 & reg4=0x0 {
+  doFan(A, A);
+}
+:FAN_A_B is op=0xf & word1=0x1 & reg3=0x0 & reg4=0x1 {
+  doFan(A, B);
+}
+:FAN_A_MX is op=0xf & word1=0x1 & reg3=0x0 & reg4=0x2 {
+  doFan(A, $(MX));
+}
+:FAN_A_MY is op=0xf & word1=0x1 & reg3=0x0 & reg4=0x3 {
+  doFan(A, $(MY));
+}
+:FAN_B_A is op=0xf & word1=0x1 & reg3=0x1 & reg4=0x0 {
+  doFan(B, A);
+}
+:FAN_B_B is op=0xf & word1=0x1 & reg3=0x1 & reg4=0x1 {
+  doFan(B, B);
+}
+:FAN_B_MX is op=0xf & word1=0x1 & reg3=0x1 & reg4=0x2 {
+  doFan(B, $(MX));
+}
+:FAN_B_MY is op=0xf & word1=0x1 & reg3=0x1 & reg4=0x3 {
+  doFan(B, $(MY));
+}
+:FAN_MX_A is op=0xf & word1=0x1 & reg3=0x2 & reg4=0x0 {
+  doFan($(MX), A);
+}
+:FAN_MX_B is op=0xf & word1=0x1 & reg3=0x2 & reg4=0x1 {
+  doFan($(MX), B);
+}
+:FAN_MX_MX is op=0xf & word1=0x1 & reg3=0x2 & reg4=0x2 {
+  doFan($(MX), $(MX));
+}
+:FAN_MX_MY is op=0xf & word1=0x1 & reg3=0x2 & reg4=0x3 {
+  doFan($(MX), $(MY));
+}
+:FAN_MY_A is op=0xf & word1=0x1 & reg3=0x3 & reg4=0x0 {
+  doFan($(MY), A);
+}
+:FAN_MY_B is op=0xf & word1=0x1 & reg3=0x3 & reg4=0x1 {
+  doFan($(MY), B);
+}
+:FAN_MY_MX is op=0xf & word1=0x1 & reg3=0x3 & reg4=0x2 {
+  doFan($(MY), $(MX));
+}
+:FAN_MY_MY is op=0xf & word1=0x1 & reg3=0x3 & reg4=0x3 {
+  doFan($(MY), $(MY));
+}
+
+macro doRotateLeft(r) {
+  C = (r >> 3) & 0x1;
+  r = ((r << 1) | C) & 0xf;
+}
 
 # Instruction set is weird on this one
 # bits (2,3) and (0,1) are set to r1, r0 bits, which are the same...
@@ -745,46 +1575,138 @@ define token instr(16)
 #:RLC1 r1 is op=0xa & word1=0xf & reg4=0x0 & r1 {}
 #:RLC2 r2 is op=0xa & word1=0xf & reg3=0x0 & r2 {}
 
-:RLC_A is op=0xa & word1=0xf & reg3=0x0 & reg4=0x0 {}
-:RLC_B is op=0xa & word1=0xf & reg3=0x1 & reg4=0x1 {}
-:RLC_MX is op=0xa & word1=0xf & reg3=0x2 & reg4=0x2 {}
-:RLC_MY is op=0xa & word1=0xf & reg3=0x3 & reg4=0x3 {}
+:RLC_A is op=0xa & word1=0xf & reg3=0x0 & reg4=0x0 {
+  doRotateLeft(A);
+}
+:RLC_B is op=0xa & word1=0xf & reg3=0x1 & reg4=0x1 {
+  doRotateLeft(B);
+}
+:RLC_MX is op=0xa & word1=0xf & reg3=0x2 & reg4=0x2 {
+  doRotateLeft($(MX));
+}
+:RLC_MY is op=0xa & word1=0xf & reg3=0x3 & reg4=0x3 {
+  doRotateLeft($(MY));
+}
+
+macro doRotateRight(r) {
+  C = r & 0x1;
+  r = ((r >> 1) | (C << 3)) & 0xf;
+}
 
 #:RRC r2 is op=0xe & word1=0x8 & reg3=0x3 & r2 {}
-:RRC_A is op=0xe & word1=0x8 & reg3=0x3 & reg4=0x0 {}
-:RRC_B is op=0xe & word1=0x8 & reg3=0x3 & reg4=0x1 {}
-:RRC_MX is op=0xe & word1=0x8 & reg3=0x3 & reg4=0x2 {}
-:RRC_MY is op=0xe & word1=0x8 & reg3=0x3 & reg4=0x3 {}
+:RRC_A is op=0xe & word1=0x8 & reg3=0x3 & reg4=0x0 {
+  doRotateRight(A);
+}
+:RRC_B is op=0xe & word1=0x8 & reg3=0x3 & reg4=0x1 {
+  doRotateRight(B);
+}
+:RRC_MX is op=0xe & word1=0x8 & reg3=0x3 & reg4=0x2 {
+  doRotateRight($(MX));
+}
+:RRC_MY is op=0xe & word1=0x8 & reg3=0x3 & reg4=0x3 {
+  doRotateRight($(MY));
+}
 
-:INC_M n is op=0xf & word1=0x6 & n {}
-:DEC_M n is op=0xf & word1=0x7 & n {}
+:INC_M n is op=0xf & word1=0x6 & n {
+  local tmp = *[ram]:1 n:2 + 1;
+  *[ram]:1 n:2 = (tmp & 0xf);
+  C = (tmp & 0x10) != 0;
+  Z = *[ram]:1 n:2 == 0;
+}
+:DEC_M n is op=0xf & word1=0x7 & n {
+  local tmp = *[ram]:1 n:2 - 1;
+  *[ram]:1 n:2 = (tmp & 0xf);
+  C = (tmp & 0x10) != 0;
+  Z = *[ram]:1 n:2 == 0;
+}
 #:ACPX r2 is op=0xf & word1=0x2 & reg3=0x2 & r2 {}
-:ACPX_A is op=0xf & word1=0x2 & reg3=0x2 & reg4=0x0 {}
-:ACPX_B is op=0xf & word1=0x2 & reg3=0x2 & reg4=0x1 {}
-:ACPX_MX is op=0xf & word1=0x2 & reg3=0x2 & reg4=0x2 {}
-:ACPX_MY is op=0xf & word1=0x2 & reg3=0x2 & reg4=0x3 {}
+:ACPX_A is op=0xf & word1=0x2 & reg3=0x2 & reg4=0x0 {
+  doAddWithCarry($(MX), A);
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
+:ACPX_B is op=0xf & word1=0x2 & reg3=0x2 & reg4=0x1 {
+  doAddWithCarry($(MX), B);
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
+:ACPX_MX is op=0xf & word1=0x2 & reg3=0x2 & reg4=0x2 {
+  doAddWithCarry($(MX), $(MX));
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
+:ACPX_MY is op=0xf & word1=0x2 & reg3=0x2 & reg4=0x3 {
+  doAddWithCarry($(MX), $(MY));
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
 
 #:ACPY r2 is op=0xf & word1=0x2 & reg3=0x3 & r2 {}
-:ACPY_A is op=0xf & word1=0x2 & reg3=0x3 & reg4=0x0 {}
-:ACPY_B is op=0xf & word1=0x2 & reg3=0x3 & reg4=0x1 {}
-:ACPY_MX is op=0xf & word1=0x2 & reg3=0x3 & reg4=0x2 {}
-:ACPY_MY is op=0xf & word1=0x2 & reg3=0x3 & reg4=0x3 {}
+:ACPY_A is op=0xf & word1=0x2 & reg3=0x3 & reg4=0x0 {
+  doAddWithCarry($(MY), A);
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
+:ACPY_B is op=0xf & word1=0x2 & reg3=0x3 & reg4=0x1 {
+  doAddWithCarry($(MY), B);
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
+:ACPY_MX is op=0xf & word1=0x2 & reg3=0x3 & reg4=0x2 {
+  doAddWithCarry($(MY), $(MX));
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
+:ACPY_MY is op=0xf & word1=0x2 & reg3=0x3 & reg4=0x3 {
+  doAddWithCarry($(MY), $(MY));
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
 
 #:SCPX r2 is op=0xf & word1=0x3 & reg3=0x2 & r2 {}
-:SCPX_A is op=0xf & word1=0x3 & reg3=0x2 & reg4=0x0 {}
-:SCPX_B is op=0xf & word1=0x3 & reg3=0x2 & reg4=0x1 {}
-:SCPX_MX is op=0xf & word1=0x3 & reg3=0x2 & reg4=0x2 {}
-:SCPX_MY is op=0xf & word1=0x3 & reg3=0x2 & reg4=0x3 {}
+:SCPX_A is op=0xf & word1=0x3 & reg3=0x2 & reg4=0x0 {
+  doSubWithCarry($(MX), A);
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
+:SCPX_B is op=0xf & word1=0x3 & reg3=0x2 & reg4=0x1 {
+  doSubWithCarry($(MX), B);
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
+:SCPX_MX is op=0xf & word1=0x3 & reg3=0x2 & reg4=0x2 {
+  doSubWithCarry($(MX), $(MX));
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
+:SCPX_MY is op=0xf & word1=0x3 & reg3=0x2 & reg4=0x3 {
+  doSubWithCarry($(MY), A);
+  $(XHL) = ($(XHL) + 1) & 0xff;
+}
 
 #:SCPY r2 is op=0xf & word1=0x3 & reg3=0x3 & r2 {}
-:SCPY_A is op=0xf & word1=0x3 & reg3=0x3 & reg4=0x0 {}
-:SCPY_B is op=0xf & word1=0x3 & reg3=0x3 & reg4=0x1 {}
-:SCPY_MX is op=0xf & word1=0x3 & reg3=0x3 & reg4=0x2 {}
-:SCPY_MY is op=0xf & word1=0x3 & reg3=0x3 & reg4=0x3 {}
+:SCPY_A is op=0xf & word1=0x3 & reg3=0x3 & reg4=0x0 {
+  doSubWithCarry($(MY), A);
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
+:SCPY_B is op=0xf & word1=0x3 & reg3=0x3 & reg4=0x1 {
+  doSubWithCarry($(MY), B);
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
+:SCPY_MX is op=0xf & word1=0x3 & reg3=0x3 & reg4=0x2 {
+  doSubWithCarry($(MY), $(MX));
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
+:SCPY_MY is op=0xf & word1=0x3 & reg3=0x3 & reg4=0x3 {
+  doSubWithCarry($(MY), $(MY));
+  $(YHL) = ($(YHL) + 1) & 0xff;
+}
+
+macro doNot(r) {
+  r = (~r & 0xf);
+  Z = r == 0;
+}
 
 #:NOT r0 is op=0xd & reg1=0x0 & word2=0xf & r0 {}
-:NOT_A is op=0xd & reg1=0x0 & word2=0xf & reg2=0x0 {}
-:NOT_B is op=0xd & reg1=0x0 & word2=0xf & reg2=0x1 {}
-:NOT_MX is op=0xd & reg1=0x0 & word2=0xf & reg2=0x2 {}
-:NOT_MY is op=0xd & reg1=0x0 & word2=0xf & reg2=0x3 {}
+:NOT_A is op=0xd & reg1=0x0 & word2=0xf & reg2=0x0 {
+  doNot(A);
+}
+:NOT_B is op=0xd & reg1=0x0 & word2=0xf & reg2=0x1 {
+  doNot(B);
+}
+:NOT_MX is op=0xd & reg1=0x0 & word2=0xf & reg2=0x2 {
+  doNot($(MX));
+}
+:NOT_MY is op=0xd & reg1=0x0 & word2=0xf & reg2=0x3 {
+  doNot($(MY));
+}
 
