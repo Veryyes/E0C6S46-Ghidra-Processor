@@ -3,6 +3,8 @@
 <processor_spec>
 	<default_memory_blocks>
     	<memory_block initialized="false" name="ram" start_address="ram:0x0000" length="0x280" mode="rw"/>
+    	<memory_block initialized="false" name="display" start_address="ram:0x0E00" length="0x100" mode="rw"/>
+    	<memory_block initialized="false" name="io" start_address="ram:0x0F00" length="0x100" mode="rw"/>
 	</default_memory_blocks>
 	<context_data>
 		<tracked_set space="rom" first="0x0000" last="0x0000">
